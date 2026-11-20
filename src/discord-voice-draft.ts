@@ -2,6 +2,7 @@ import { ChannelType, MessageFlags, MessageReferenceType, MessageType, type Mess
 import { DeliveryError } from "./delivery.ts";
 
 const CONFIRM = "/voice confirm";
+const CONFIRM_REACTION = "\u2705";
 export const VOICE_DRAFT_HEADER = "Proposed work from the live voice session (not yet submitted).\n";
 const PROPOSAL_TTL_MS = 5 * 60 * 1000;
 const MESSAGE_LIMIT = 2000;
@@ -16,6 +17,17 @@ type PostedDraft = {
   readonly work: string;
 };
 
+/** The facts of one Discord reaction-add event, copied from the event, never from a cached message. */
+export type DraftReaction = {
+  readonly messageId: string;
+  readonly channelId: string;
+  readonly guildId: string | null;
+  readonly userId: string;
+  readonly userIsBot: boolean;
+  /** Unicode emoji name, or null for a custom emoji. */
+  readonly emoji: string | null;
+};
+
 type Draft = {
   readonly signal: AbortSignal;
   readonly startedAt: number;
@@ -25,6 +37,8 @@ type Draft = {
 export class VoiceDrafts {
   private draft: Draft | null = null;
   private sending = false;
+
+  constructor(private readonly headContext = false) {}
 
   /** The caller supplies the session's already allowlisted, bound guild text channel. */
   async propose(channel: TextChannel, ownerId: string, text: string, signal: AbortSignal): Promise<void> {
@@ -49,9 +63,11 @@ export class VoiceDrafts {
       ? character : `\\u{${character.codePointAt(0)!.toString(16)}}`);
     const content = VOICE_DRAFT_HEADER +
       `\`\`\`\n${literal}\n\`\`\`\n` +
-      `To submit this proposal to HEAD, reply to this message with exactly \`${CONFIRM}\` ` +
+      `To submit this proposal to HEAD, react to this message with ${CONFIRM_REACTION} or reply to it with exactly \`${CONFIRM}\` ` +
       "while the voice session is active and within five minutes.\n" +
-      "HEAD replies in Discord text. OpenAI Live does not receive the reply content. " +
+      "HEAD replies in Discord text. " + (this.headContext
+        ? "This session also sends HEAD's reply text to OpenAI Live. "
+        : "OpenAI Live does not receive the reply content. ") +
       "Risky actions still require separate approval.";
     if (content.length > MESSAGE_LIMIT) {
       throw new DeliveryError("Voice work proposal is too long to review in one Discord message.", "rejected");
@@ -101,6 +117,18 @@ export class VoiceDrafts {
       (reference.guildId !== undefined && reference.guildId !== draft.guildId) ||
       (reference.type !== undefined && reference.type !== MessageReferenceType.Default)) return null;
 
+    return this.accept(draft);
+  }
+
+  /** Call only for fresh reaction-add events. The one draft is consumed, so a replayed or repeated reaction returns null. */
+  consumeReaction(reaction: DraftReaction): string | null {
+    const draft = this.current()?.posted;
+    if (!draft || reaction.emoji !== CONFIRM_REACTION || reaction.userIsBot || reaction.userId !== draft.ownerId ||
+      reaction.messageId !== draft.id || reaction.channelId !== draft.channelId || reaction.guildId !== draft.guildId) return null;
+    return this.accept(draft);
+  }
+
+  private accept(draft: PostedDraft): string {
     this.clear();
     return "Work proposed in a live Discord voice session and confirmed by the owner in writing.\n" +
       "This is an ordinary work request, not a slash command, native control, or approval. " +

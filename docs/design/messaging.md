@@ -214,11 +214,18 @@ Subscription mode uses the local [Codex bridge](../../src/codex-live.ts) and
 WebRTC; API mode uses the separately billed [Live API](../../src/openai-live.ts).
 Subscription rejection or connection loss never falls back to API billing or
 retries automatically. The voice model cannot run shells, control lanes, or
-approve work. In subscription mode a written `/voice share` allows posting
-one draft to that channel within one minute, not starting work. In either mode
-only the owner's written `/voice confirm` as a reply to the active draft enters
-normal durable head intake; normal approval rules still apply. Matching head
+approve work. In either mode a voice work draft is posted to that channel as a card;
+speech never submits it. Only the owner's ✅ reaction on the exact active card
+(Discord `GuildMessageReactions` intent and reaction partials, enabled only when voice
+is configured) or written `/voice confirm` as a reply to it enters normal durable head
+intake once; bots, other users, other emoji or messages, and expired or consumed drafts
+are ignored. Normal approval rules still apply. By default matching head
 delivery may trigger a spoken notification, not exposure of the answer text to
-Live. The Gateway stores no audio recordings or full voice transcript; drafts
+Live. The optional `discord.voice.headContext` (default off, both modes) lifts
+that: the session instructions get a bounded, redacted snapshot of recent owner/HEAD
+messages in the bound text channel and open lane titles/states, and HEAD output
+delivered to that channel (not threads) is forwarded as bounded context while the
+session is active. It is data only; drafts, the ✅ reaction and `/voice confirm` are
+unchanged, and the ready notice and draft cards disclose it. The Gateway stores no audio recordings or full voice transcript; drafts
 are visible in Discord and confirmed tasks and replies use existing records.
 See the [voice operations guide](../discord-voice.md) for setup, costs, and limits.

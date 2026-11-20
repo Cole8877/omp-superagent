@@ -262,3 +262,35 @@ test("announces a matching text reply with fixed commentary, without creating a 
   }]);
   expect(proposals).toEqual([]);
 });
+
+test("appends bounded HEAD context only when opted in, and forwards reply text as chunked context", async () => {
+  const plain = await start();
+  expect(JSON.stringify(plain.provider.sent[0])).not.toContain("head_context");
+  plain.live.notifyHeadReply("private reply text");
+  expect(JSON.stringify(plain.provider.sent)).not.toContain("private reply text");
+
+  const context = "<head_context>\nowner: hello\n</head_context>";
+  Object.defineProperty(globalThis, "WebSocket", { ...connection, value: ProviderFixture });
+  const controller = new AbortController();
+  const ready = openLive({ ...options, headContext: context }, {
+    audio() {}, interrupt() {}, ended() {}, forward: async () => receipt,
+  }, controller.signal);
+  const provider = fixture!;
+  connections.push({ controller, provider });
+  provider.open();
+  expect((provider.sent[0] as unknown as { session: { instructions: string } }).session.instructions).toEndWith(`\n\n${context}`);
+  provider.push({ type: "session.started", session: { id: "live_ctx" } });
+  const live = await ready;
+
+  const reply = "답".repeat(900) + "x".repeat(900);
+  live.notifyHeadReply(reply);
+  const sent = provider.sent.filter(event => event.type !== "session.start");
+  const chunks = sent.filter(event => event.type === "session.thinking.append");
+  expect(chunks.map(event => event.content?.length)).toEqual([400, 400, 400]);
+  expect(chunks.map(event => event.content).join("")).toBe(Array.from(reply).slice(0, 1_200).join(""));
+  expect(chunks.every(event => event.delegation_id === null)).toBe(true);
+  expect(sent.at(-1)).toEqual({
+    type: "session.commentary.append", delegation_id: null,
+    content: "A reply from the head is available in the text channel.",
+  });
+});

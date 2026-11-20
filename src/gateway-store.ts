@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { chmodSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { DialogResponse, DiscordPurposeRequest, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, Route } from "./contracts";
+import type { DialogResponse, DiscordPurposeRequest, GatewayRestartNotice, GatewayRestartRecord, GatewayRestartRequest, Inbound, Lane, Route } from "./contracts";
 import { routeKey } from "./contracts";
 import { authorizeDiscordPurpose } from "./discord-context";
 import { DeliveryError } from "./delivery";
+import { readLaneRows } from "./lane-rows";
 
 export type GatewayEvent =
   | { kind: "message"; input: Inbound }
@@ -91,6 +92,11 @@ export class GatewayStore {
   }
   setMeta(key: string, value: string): void {
     this.db.query("INSERT INTO metadata VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, value);
+  }
+
+  /** Lane rows are written by the head's store, so the table can be absent before its first start. */
+  lanes(): Lane[] {
+    return this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lanes'").get() ? readLaneRows(this.db) : [];
   }
 
   validateDiscordPurpose(request: DiscordPurposeRequest): void {

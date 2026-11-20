@@ -17,6 +17,8 @@ Gateway가 메신저 연결과 헤드 수명을 맡고, 모든 요청·후속 �
 
 선택 기능인 [Discord 실시간 음성채팅](discord-voice.md)은 일반 대화를 별도 OpenAI Live 세션에서
 처리한다. 음성 모델이 제안한 작업은 소유자가 원래 텍스트 채널에서 서면으로 확인해야 HEAD에 접수된다.
+기본값에서는 HEAD 답변 본문을 OpenAI에 보내지 않는다. `discord.voice.headContext`를 켜면 최근 텍스트 대화·레인 상태와
+HEAD 답변 본문(길이 제한)을 보낸다([전송 범위](discord-voice.md#개인정보비용)).
 
 ### 레인 관리 도구와 운영 스킬
 

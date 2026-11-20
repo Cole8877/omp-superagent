@@ -26,7 +26,9 @@ test("a relative Codex profile is rejected instead of opening the default subscr
 const childSource = String.raw`
 const send = event => process.stdout.write(JSON.stringify(event) + "\n");
 const pcm = bytes => send({ type: "audio", audio: Buffer.from(bytes).toString("base64") });
-const voice = process.argv.at(-1);
+const hasContext = process.argv.at(-1) === "context";
+const voice = process.argv.at(hasContext ? -2 : -1);
+const text = value => { const bytes = Buffer.from(value); return bytes.length % 2 ? Buffer.concat([bytes, Buffer.from(" ")]) : bytes; };
 if (Object.keys(process.env).some(key => ["OPENAI_API_KEY", "DISCORD_BOT_TOKEN", "HTTPS_PROXY", "PYTHONPATH"].includes(key))) {
   send({ type: "ended" });
   process.exit(1);
@@ -52,7 +54,9 @@ for await (const line of reader) {
     }
   }
   if (event.type === "draft_result") pcm([event.posted ? 1 : 2, 0]);
+  if (event.type === "context") pcm(text("context:" + event.text));
   if (event.type === "notify") {
+    if (event.text) pcm(text("reply:" + event.text));
     if (voice === "arbor") send({ type: "audio", audio: "AQ==" });
     else {
       pcm([3, 0]);
@@ -166,5 +170,36 @@ test("invalid PCM from a ready bridge terminates voice without emitting audio", 
     await ended.promise;
 
     expect(audio).toEqual([]);
+  });
+});
+
+test("opt-in HEAD context reaches the bridge as its first frame and reply text as a notify payload", async () => {
+  await withFixture(async signal => {
+    const sawReply = Promise.withResolvers<void>();
+    const audio: string[] = [];
+    const session = await openCodexLive({ voice: "cove", headContext: "<head_context>owner: hi</head_context>" }, {
+      audio(pcm) {
+        audio.push(pcm.toString().trim());
+        if (pcm.toString().startsWith("reply:")) sawReply.resolve();
+      },
+      interrupt() {}, ended() {}, async forward() { return "not expected"; },
+    }, signal);
+    session.notifyHeadReply("HEAD says done");
+    await sawReply.promise;
+    expect(audio.slice(0, 2)).toEqual(["context:<head_context>owner: hi</head_context>", "reply:HEAD says done"]);
+  });
+});
+
+test("without opt-in the bridge receives no context frame", async () => {
+  await withFixture(async signal => {
+    const audio: string[] = [];
+    const notice = Promise.withResolvers<void>();
+    const session = await openCodexLive({ voice: "cove" }, {
+      audio(pcm) { audio.push(pcm.toString("latin1")); if (pcm.equals(notified)) notice.resolve(); },
+      interrupt() {}, ended() {}, async forward() { return "not expected"; },
+    }, signal);
+    session.notifyHeadReply();
+    await notice.promise;
+    expect(audio.some(text => text.startsWith("context:") || text.startsWith("reply:"))).toBe(false);
   });
 });

@@ -16,6 +16,8 @@ type DiscordVoiceSessionConfig = {
   readonly textChannelId: string;
   readonly voice: string;
   readonly maxSessionSeconds: number;
+  /** Opt in to sending bounded HEAD conversation and lane status to the voice provider. Absent means off. */
+  readonly headContext?: true;
 };
 
 export type DiscordVoiceConfig = DiscordVoiceSessionConfig & (
@@ -72,6 +74,10 @@ function text(value: unknown, name: string): string {
 function integer(value: unknown, name: string, minimum: number): number {
   if (!Number.isSafeInteger(value) || (value as number) < minimum) throw new Error(`${name} must be an integer >= ${minimum}`);
   return value as number;
+}
+function flag(value: unknown, name: string): boolean {
+  if (value !== undefined && typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+  return value === true;
 }
 function ids(value: unknown, name: string, pattern = /^\d+$/): string[] {
   if (!Array.isArray(value) || !value.every(v => typeof v === "string" && pattern.test(v)))
@@ -189,11 +195,14 @@ export function parseConfig(value: unknown, path: string): Config {
       throw new Error("discord.voice.textChannelId must be a separate, allowed text channel");
     const maxSessionSeconds = integer(voice.maxSessionSeconds, "discord.voice.maxSessionSeconds", 1);
     if (maxSessionSeconds * 1000 > 2 ** 31 - 1) throw new Error("discord.voice.maxSessionSeconds exceeds timer range");
-    const session = { channelId, textChannelId, voice: text(voice.voice, "discord.voice.voice"), maxSessionSeconds };
+    const session = {
+      channelId, textChannelId, voice: text(voice.voice, "discord.voice.voice"), maxSessionSeconds,
+      ...(flag(voice.headContext, "discord.voice.headContext") ? { headContext: true as const } : {}),
+    };
     const auth = voice.auth;
     switch (auth) {
       case "subscription": {
-        const unsupported = Object.keys(voice).find(key => key !== "auth" && !Object.hasOwn(session, key));
+        const unsupported = Object.keys(voice).find(key => key !== "auth" && key !== "headContext" && !Object.hasOwn(session, key));
         if (unsupported !== undefined) throw new Error(`discord.voice.${unsupported} is not supported with subscription auth`);
         voiceConfig = { ...session, auth: "subscription" };
         break;

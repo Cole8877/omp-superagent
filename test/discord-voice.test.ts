@@ -79,12 +79,7 @@ test.each(["api", "subscription", "subscription rejected"] as const)("%s: explic
     live.audio(pcm);
     expect(fromOwner).toEqual([pcm]);
     expect(toOwner).toEqual([pcm]);
-    if (mode === "subscription") {
-      await expect(live.forward("Private remark")).rejects.toThrow("No written permission");
-      voice.command(...message("/voice share", "201"));
-    }
     expect(await live.forward("Inspect the failed check")).toContain("Not yet submitted");
-    if (mode === "subscription") await expect(live.forward("Another private remark")).rejects.toThrow("No written permission");
     const confirmation = message("/voice confirm", "301", true);
     expect(voice.command(...confirmation)).toContain("Inspect the failed check");
     expect(voice.command(...confirmation)).toBeNull();
@@ -96,6 +91,13 @@ test.each(["api", "subscription", "subscription rejected"] as const)("%s: explic
     voice.textDelivered(output);
     voice.textDelivered(output);
     expect(notified).toBe(1);
+    expect(await live.forward("Check the deploy queue")).toContain("Not yet submitted");
+    const reaction = { messageId: "300", channelId: text.id, guildId: route.guildId, userId: route.authorityId, userIsBot: false, emoji: "\u2705" };
+    const [, reacted] = message("\u2705", "303", true);
+    expect(voice.reaction({ ...reaction, userId: "other" }, reacted)).toBeNull();
+    expect(voice.reaction({ ...reaction, channelId: "elsewhere" }, reacted)).toBeNull();
+    expect(voice.reaction(reaction, reacted)).toContain("Check the deploy queue");
+    expect(voice.reaction(reaction, reacted)).toBeNull();
     voice.command(...message("/voice stop", "302"));
     expect(signal.aborted).toBe(true);
     discord.audio(pcm);

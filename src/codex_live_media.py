@@ -45,10 +45,20 @@ class DraftResult(BaseModel):
 class Notify(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
     type: Literal["notify"]
+    text: str | None = Field(default=None, min_length=1, max_length=1_200)
+
+
+class Context(BaseModel):
+    """Opt-in HEAD snapshot, sent once as the first stdin frame before any other command."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+    type: Literal["context"]
+    text: str = Field(min_length=1, max_length=6_000)
 
 
 type Command = Input | DraftResult | Notify
 COMMANDS: Final = TypeAdapter(Command)
+CONTEXT: Final = TypeAdapter(Context)
 
 
 class BridgeEvent(TypedDict):
@@ -207,8 +217,10 @@ async def run_peer(
                             raise BridgeError("Uncorrelated voice draft result.")
                         pending.remove(identifier)
                         await append_speech(sideband, POSTED if posted else NOT_POSTED, identifier)
-                    case Notify():
-                        await append_speech(sideband, REPLY_NOTICE)
+                    case Notify(text=text):
+                        # Never relay text that contains the live credentials; the notice alone is safe.
+                        shared = text if text and not any(secret.get_secret_value() in text for secret in secrets) else None
+                        await append_speech(sideband, REPLY_NOTICE if shared is None else f"{REPLY_NOTICE}\n{shared}")
                     case _ as unreachable:
                         assert_never(unreachable)
             tasks.cancel_scope.cancel()

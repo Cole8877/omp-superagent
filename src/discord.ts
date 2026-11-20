@@ -3,9 +3,9 @@ import {
   ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, ChannelFlagsBitField, ChannelType, Client,
   Events, GatewayIntentBits, MessageFlags, ModalBuilder, Partials, PermissionFlagsBits, StringSelectMenuBuilder,
   Routes, TextInputBuilder, TextInputStyle,
-  type ChatInputCommandInteraction, type ForumChannel, type Interaction, type MediaChannel, type Message, type MessageCreateOptions, type PartialMessage, type PermissionsBitField,
+  type ChatInputCommandInteraction, type ForumChannel, type Interaction, type MediaChannel, type Message, type MessageCreateOptions, type PartialMessage, type PartialMessageReaction, type PartialUser, type MessageReaction, type User, type PermissionsBitField,
 } from "discord.js";
-import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type DiscordContext, type DiscordPurposeNote, type DiscordPurposeRequest, type Inbound, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type ReplyContext, type Route, type StorePort, type ThreadInfo, type ThreadUpdate } from "./contracts.ts";
+import { physicalRoute, physicalRouteKey, routeKey, type Approval, type Attachment, type DialogResponse, type DiscordContext, type DiscordPurposeNote, type DiscordPurposeRequest, type Inbound, type Lane, type MessageActivity, type MessageReference, type Messenger, type OutputRecord, type ReplyContext, type Route, type StorePort, type ThreadInfo, type ThreadUpdate } from "./contracts.ts";
 import { changeDiscordPurpose, discordPurposeNotes, discordPurposeRequest } from "./discord-context";
 import { validateDecisionAnswer, validateDecisionResponse } from "./decisions";
 import { parseDialog, type Dialog } from "./dialog.ts";
@@ -47,6 +47,8 @@ export interface DiscordMessengerOptions {
   allowedChannelIds: string[];
   voice?: DiscordVoiceConfig;
   voiceApiKey?: string;
+  /** Read-only lane list for discord.voice.headContext. */
+  lanes?: () => readonly Lane[];
   /** A supported discord.js Client, primarily for deterministic transport tests. */
   client?: Client;
   /** Attachment HTTP boundary; Discord credentials are never sent to the CDN. */
@@ -140,6 +142,29 @@ export class DiscordMessenger implements Messenger {
     }
     this.enqueue(message, true);
   };
+  private readonly onReaction = (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+    const config = this.options.voice;
+    const message = reaction.message;
+    const guildId = message.guildId;
+    if (!this.voice || !config || !guildId || user.id !== this.options.ownerId || user.bot === true ||
+      reaction.emoji.id !== null || message.channelId !== config.textChannelId) return;
+    const admission = this.admission;
+    const voiceEpoch = this.voiceConnected && admission?.resolvedReady ? this.voiceEpoch : null;
+    if (voiceEpoch === null) return;
+    this.intake = this.intake.then(async () => {
+      const accountId = this.client.user?.id;
+      if (!await this.admitted(admission) || voiceEpoch !== this.voiceEpoch || !this.voiceConnected ||
+        !accountId || !this.guilds.has(guildId)) return;
+      const route: Route = { platform: "discord", accountId, authorityId: this.options.ownerId, guildId, channelId: config.textChannelId, threadId: null };
+      const input: Inbound = {
+        id: `discord:${accountId}:${message.id}:reaction`, route, messageId: message.id,
+        text: reaction.emoji.name ?? "", receivedAt: Date.now(), attachments: [], discordContext: this.context(route),
+      };
+      const work = this.voice?.reaction({ messageId: message.id, channelId: message.channelId, guildId,
+        userId: user.id, userIsBot: false, emoji: reaction.emoji.name }, input);
+      if (work) await this.handlers?.message({ ...input, text: work });
+    }).catch(this.report);
+  };
   private readonly onEdit = (_old: Message | PartialMessage, message: Message | PartialMessage) => { this.enqueue(message, false); };
   private readonly onInteraction = (interaction: Interaction) => { void this.interact(interaction).catch(this.report); };
   private readonly onReconnect = () => {
@@ -156,11 +181,14 @@ export class DiscordMessenger implements Messenger {
     this.channels = new Set(options.allowedChannelIds);
     this.report = options.onError ?? (error => console.error("Discord event failed:", error));
     if (options.voice) this.voice = new DiscordVoice(options.voice, options.ownerId,
-      options.voiceApiKey !== options.token ? options.voiceApiKey : undefined, this.report);
+      options.voiceApiKey !== options.token ? options.voiceApiKey : undefined, this.report,
+      undefined, undefined, undefined, options.voice.headContext && options.lanes ? {
+        lanes: options.lanes, secrets: [options.token, options.voiceApiKey ?? ""],
+      } : undefined);
     this.client = options.client ?? new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.DirectMessages, GatewayIntentBits.MessageContent,
-        ...(options.voice ? [GatewayIntentBits.GuildVoiceStates] : [])],
-      partials: [Partials.Channel, Partials.Message],
+        ...(options.voice ? [GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions] : [])],
+      partials: [Partials.Channel, Partials.Message, ...(options.voice ? [Partials.Reaction] : [])],
       allowedMentions: NO_MENTIONS,
       rest: { retries: 0, rejectOnRateLimit: () => true },
     });
@@ -189,6 +217,7 @@ export class DiscordMessenger implements Messenger {
     void admission.ready.then(ready => { admission.resolvedReady = ready; });
     this.client.on(Events.MessageCreate, this.onMessage);
     this.client.on(Events.MessageUpdate, this.onEdit);
+    if (this.voice) this.client.on(Events.MessageReactionAdd, this.onReaction);
     this.client.on(Events.InteractionCreate, this.onInteraction);
     this.client.on(Events.ShardResume, this.onReconnect);
     this.client.on(Events.ShardDisconnect, this.onVoiceDisconnect);
@@ -997,6 +1026,7 @@ export class DiscordMessenger implements Messenger {
     }
     this.client.off(Events.MessageCreate, this.onMessage);
     this.client.off(Events.MessageUpdate, this.onEdit);
+    this.client.off(Events.MessageReactionAdd, this.onReaction);
     this.client.off(Events.InteractionCreate, this.onInteraction);
     this.client.off(Events.ShardResume, this.onReconnect);
     this.client.off(Events.ShardDisconnect, this.onVoiceDisconnect);
