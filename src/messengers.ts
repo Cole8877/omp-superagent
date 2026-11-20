@@ -124,7 +124,7 @@ export class MessengerHub implements Messenger {
   }
 }
 
-export function createMessenger(config: Config, store: Pick<StorePort, "getMeta" | "setMeta">, onError: (error: unknown) => void): MessengerHub {
+export function createMessenger(config: Config, store: Pick<StorePort, "getMeta" | "setMeta" | "lanes">, onError: (error: unknown) => void): MessengerHub {
   requireMessengerCredentials(config);
   const adapters: Partial<Record<Platform, Messenger>> = {};
   if (config.discord) {
@@ -134,7 +134,7 @@ export function createMessenger(config: Config, store: Pick<StorePort, "getMeta"
     // configured transport token as a bearer credential on the OpenAI socket.
     const shared = key && credentialEnvNames(config).some(name => name !== keyName && process.env[name] === key);
     adapters.discord = new DiscordMessenger({
-      ...config.discord, token: process.env[config.discord.tokenEnv]!, voiceApiKey: shared ? undefined : key, store, onError,
+      ...config.discord, token: process.env[config.discord.tokenEnv]!, voiceApiKey: shared ? undefined : key, lanes: () => store.lanes(), store, onError,
     });
   }
   if (config.telegram) adapters.telegram = new TelegramMessenger({

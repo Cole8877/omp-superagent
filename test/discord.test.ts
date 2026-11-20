@@ -237,6 +237,27 @@ describe("Discord routing and parsing", () => {
       expect(channel.sent).toHaveLength(2);
     } finally { await messenger.stop(); }
   });
+  test("a reaction is observed only when voice is configured and never submits without an active draft", async () => {
+    const plain = await fixture();
+    try { expect(plain.gateway.listenerCount(Events.MessageReactionAdd)).toBe(0); } finally { await plain.messenger.stop(); }
+    const { messenger, gateway, channel, received, errors } = await fixture({ voice: {
+      apiKeyEnv: "SUPERAGENT_TEST_ABSENT_VOICE_KEY", channelId: "401", textChannelId: "parent",
+      model: "speech", backendModel: "delegate", voice: "selected", maxSessionSeconds: 60,
+    } });
+    try {
+      expect(gateway.listenerCount(Events.MessageReactionAdd)).toBe(1);
+      const reaction = (patch: Record<string, unknown> = {}) => ({ emoji: { id: null, name: "\u2705" },
+        message: { id: "300", channelId: channel.id, guildId: channel.guildId }, ...patch });
+      gateway.emit(Events.MessageReactionAdd, reaction(), { id: owner, bot: false });
+      gateway.emit(Events.MessageReactionAdd, reaction(), { id: "someone-else", bot: false });
+      gateway.emit(Events.MessageReactionAdd, reaction(), { id: owner, bot: true });
+      gateway.emit(Events.MessageReactionAdd, reaction({ message: { id: "300", channelId: "other", guildId: "guild" } }), { id: owner, bot: false });
+      await drain();
+      expect(received).toEqual([]);
+      expect(errors).toEqual([]);
+    } finally { await messenger.stop(); }
+    expect(gateway.listenerCount(Events.MessageReactionAdd)).toBe(0);
+  });
   test("an ordinary reply to a voice draft never includes the unconfirmed task, even from history", async () => {
     const { messenger, gateway, channel, received } = await fixture();
     try {

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MAX_CONTEXT_CHARS, MAX_REPLY_CHARS } from "./discord-voice-context";
 import type { openLive } from "./openai-live";
 
 const BRIDGE = fileURLToPath(new URL("./codex-live-bridge.py", import.meta.url));
@@ -21,7 +22,8 @@ type LiveSession = Awaited<ReturnType<typeof openLive>>;
 type BridgeCommand =
   | { readonly type: "input"; readonly audio: string }
   | { readonly type: "draft_result"; readonly id: string; readonly posted: boolean }
-  | { readonly type: "notify" }
+  | { readonly type: "context"; readonly text: string }
+  | { readonly type: "notify"; readonly text?: string }
   | { readonly type: "stop" };
 
 class CodexLiveError extends Error {
@@ -33,7 +35,7 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 export async function openCodexLive(
-  options: { readonly voice: string }, handlers: LiveHandlers, signal: AbortSignal,
+  options: { readonly voice: string; readonly headContext?: string }, handlers: LiveHandlers, signal: AbortSignal,
 ): Promise<LiveSession> {
   if (signal.aborted) throw new CodexLiveError("Codex voice startup was cancelled.");
   if (!VOICES.has(options.voice)) throw new CodexLiveError("Unsupported Codex subscription voice.");
@@ -55,7 +57,9 @@ export async function openCodexLive(
     if (value && isAbsolute(value)) env[key] = value;
   }
   const processGroup = process.platform !== "win32";
-  const child = spawn(python, ["-E", "-s", "-B", "-u", BRIDGE, options.voice], {
+  // The bridge reads the optional startup context from its first stdin frame, never argv or env.
+  const headContext = options.headContext ? Array.from(options.headContext).slice(0, MAX_CONTEXT_CHARS).join("") : undefined;
+  const child = spawn(python, ["-E", "-s", "-B", "-u", BRIDGE, options.voice, ...(headContext ? ["context"] : [])], {
     cwd: home, env, stdio: ["pipe", "pipe", "ignore"], detached: processGroup, windowsHide: true,
   });
   const ready = Promise.withResolvers<LiveSession>();
@@ -140,12 +144,13 @@ export async function openCodexLive(
       }
       if (phase === "active") send({ type: "input", audio: pcm.toString("base64") });
     },
-    notifyHeadReply() {
+    notifyHeadReply(reply) {
       if (phase === "active") {
         // A notification is never itself a new owner request. Do not reuse speech
         // from before the notification if it prompts the model to delegate.
         draftedUtterance = utterance;
-        send({ type: "notify" });
+        send(reply === undefined ? { type: "notify" }
+          : { type: "notify", text: Array.from(reply).slice(0, MAX_REPLY_CHARS).join("") });
       }
     },
     close: abort,
@@ -239,6 +244,7 @@ export async function openCodexLive(
     clearTimeout(closeDeadline);
   });
   signal.addEventListener("abort", abort, { once: true });
+  if (headContext) send({ type: "context", text: headContext });
   if (signal.aborted) abort();
   return ready.promise;
 }

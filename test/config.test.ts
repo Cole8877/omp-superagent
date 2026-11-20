@@ -76,6 +76,14 @@ describe("operator execution limits", () => {
       }
     }
   });
+  test.each(["api", "subscription"] as const)("headContext is opt-in for %s voice and absent by default", async mode => {
+    const base = mode === "api" ? paidVoice : { ...voiceSession, auth: "subscription" as const };
+    const voice = async (patch: object) => (await loadConfig(await config({ discord: { ...voiceDiscord, voice: { ...base, ...patch } } }))).discord?.voice;
+    expect((await voice({}))?.headContext).toBeUndefined();
+    expect((await voice({ headContext: false }))?.headContext).toBeUndefined();
+    expect((await voice({ headContext: true }))?.headContext).toBe(true);
+    for (const headContext of ["yes", 1, null]) await expect(voice({ headContext })).rejects.toThrow("discord.voice.headContext");
+  });
   test.each([
     ["model", "speech"],
     ["backendModel", ""],

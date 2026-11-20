@@ -3,7 +3,7 @@ import {
   ChannelType, MessageFlags, MessageReferenceType, MessageType,
   type Message, type MessageCreateOptions, type MessageReference, type TextChannel,
 } from "discord.js";
-import { VoiceDrafts } from "../src/discord-voice-draft.ts";
+import { VoiceDrafts, type DraftReaction } from "../src/discord-voice-draft.ts";
 
 const botId = "200";
 const ownerId = "300";
@@ -217,4 +217,69 @@ test("rejects empty, raw oversize, and rendered oversize proposals without posti
   await expect(propose("a".repeat(2_001))).rejects.toThrow("too long");
   await expect(propose("`".repeat(400))).rejects.toThrow("too long");
   expect(sent).toHaveLength(0);
+});
+
+const check: DraftReaction = { messageId: cardId, channelId, guildId, userId: ownerId, userIsBot: false, emoji: "\u2705" };
+
+test("the owner's check-mark reaction on the exact card submits the same one-shot work as a written reply", async () => {
+  const { drafts, propose, sent } = fixture();
+  await propose();
+
+  expect(sent[0]?.content).toContain("react to this message with \u2705");
+  const input = drafts.consumeReaction(check);
+  expect(input).toMatch(/voice session.*confirmed by the owner in writing/);
+  expect(input?.endsWith(`\n\n${work}`)).toBe(true);
+  expect(drafts.consumeReaction(check)).toBeNull();
+  expect(drafts.consume(reply())).toBeNull();
+});
+
+const invalidReactions: readonly (readonly [string, Partial<DraftReaction>])[] = [
+  ["other user", { userId: "301" }],
+  ["bot user", { userIsBot: true }],
+  ["other emoji", { emoji: "\u{1F44D}" }],
+  ["custom emoji", { emoji: null }],
+  ["other message", { messageId: "601" }],
+  ["other channel", { channelId: "501" }],
+  ["other guild", { guildId: "401" }],
+  ["DM", { guildId: null }],
+];
+
+for (const [violation, patch] of invalidReactions) {
+  test(`does not consume a draft on a reaction from ${violation}`, async () => {
+    const { drafts, propose } = fixture();
+    await propose();
+
+    expect(drafts.consumeReaction({ ...check, ...patch })).toBeNull();
+    expect(drafts.consumeReaction(check)).not.toBeNull();
+  });
+}
+
+test("a reaction cannot confirm an expired, consumed or cleared card, or one that is still being sent", async () => {
+  const delivery = Promise.withResolvers<void>();
+  const sending = fixture(delivery.promise);
+  const pending = sending.propose();
+  expect(sending.drafts.consumeReaction(check)).toBeNull();
+  delivery.resolve();
+  await pending;
+  expect(sending.drafts.consumeReaction(check)).not.toBeNull();
+
+  const clock = spyOn(Date, "now").mockReturnValue(500);
+  try {
+    const { drafts, propose } = fixture();
+    await propose();
+    clock.mockReturnValue(500 + 5 * 60 * 1000);
+    expect(drafts.consumeReaction(check)).toBeNull();
+  } finally {
+    clock.mockRestore();
+  }
+
+  const replied = fixture();
+  await replied.propose();
+  replied.drafts.consume(reply());
+  expect(replied.drafts.consumeReaction(check)).toBeNull();
+
+  const closed = fixture();
+  await closed.propose();
+  closed.session.abort();
+  expect(closed.drafts.consumeReaction(check)).toBeNull();
 });

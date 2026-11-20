@@ -161,10 +161,13 @@ crash supervisor; Linux service installation is not provided.
 ## Working from chat
 
 Discord can optionally join a private voice conversation with the owner. A separate
-OpenAI Live session answers speech; work goes to HEAD only after written confirmation.
+OpenAI Live session answers speech; work goes to HEAD only after the owner confirms the posted draft (✅ reaction or `/voice confirm` reply).
 Select Codex subscription voice or the separately billed API in the
 [voice configuration guide](docs/discord-voice.md). Voice is off by default;
-a rejected subscription call never switches to API billing.
+a rejected subscription call never switches to API billing. By default the voice model
+never sees HEAD's replies. The opt-in `discord.voice.headContext` sends a bounded, redacted
+snapshot of the text channel's recent owner/HEAD messages and open lane titles/states to
+OpenAI at session start, and HEAD's reply text in that channel while the session is on.
 
 - Ask normally. Questions get direct answers; work instructions open a topic with a
   brief approach, followed by meaningful progress and results.

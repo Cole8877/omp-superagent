@@ -32,7 +32,7 @@ INSTRUCTIONS: Final = (
     "Put one concise, self-contained draft in the client delegation input_text, in the owner's language. "
     "Never derive a new delegation from your own speech, notices, or delegation results. "
     "Client delegation can only post a draft for written confirmation. Voice never approves, submits, or executes work. "
-    "Before dictating a work draft, the owner must type /voice share in the bound Discord text channel to allow one draft to be posted there. "
+    "A posted draft is submitted only when the owner reacts with a check mark on it or replies /voice confirm in the Discord text channel; speech never does. "
     "Never claim a draft was posted without an explicit client result saying so."
 )
 
@@ -110,7 +110,7 @@ def call_id(headers: httpx2.Headers) -> str:
 
 @asynccontextmanager
 async def connect_subscription(
-    offer: str, voice: str, login: CodexLogin,
+    offer: str, voice: str, login: CodexLogin, context: str = "",
 ) -> AsyncIterator[tuple[str, ClientConnection]]:
     if voice not in VOICES or not valid_sdp(offer):
         raise BridgeError("Invalid Codex subscription voice offer.")
@@ -134,7 +134,7 @@ async def connect_subscription(
             "sdp": offer,
             "session": {
                 "model": "gpt-live-1-codex",
-                "instructions": INSTRUCTIONS,
+                "instructions": f"{INSTRUCTIONS}\n\n{context}" if context else INSTRUCTIONS,
                 "audio": {"output": {"voice": voice}},
                 "delegation": {"type": "client"},
             },

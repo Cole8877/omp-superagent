@@ -104,6 +104,7 @@ Add Discord voice using a Codex subscription (optional; no API key or paid fallb
   restrict the voice channel to the owner and bot, and include the text channel in discord.allowedChannelIds.
   {"auth":"subscription","channelId":"VOICE_CHANNEL_ID","textChannelId":"TEXT_CHANNEL_ID","voice":"cove","maxSessionSeconds":300}
   Do not include apiKeyEnv, model or backendModel in this object.
+  Optional "headContext":true sends recent channel text, open lane titles/states and HEAD reply text to OpenAI (default off).
 
   As the OS user running the Gateway (macOS/Linux):
     codex login                         # Sign in with an eligible ChatGPT account, not an API key.
@@ -121,8 +122,7 @@ Alternative: Discord voice with separately billed OpenAI Live API (no Codex logi
 
   Owner commands are ordinary Discord messages in the configured text channel, not CLI or registered slash commands:
     /voice start    Join the configured voice channel first, then send this to open the call.
-    /voice share    Subscription only: allow one draft to be posted here within one minute. API mode posts drafts directly.
-    /voice confirm  Reply to the exact posted draft to submit it to HEAD. Separate approvals still apply.
+    /voice confirm  Reply to the exact posted draft to submit it to HEAD. Reacting \u2705 to that draft as the owner does the same. Separate approvals still apply.
     /voice stop     End the call.
   Full guide: ${join(import.meta.dir, "../docs/discord-voice.md")}
 `;

@@ -1,7 +1,8 @@
 import { ChannelType, MessageType, type Message, type TextChannel } from "discord.js";
 import type { DiscordVoiceConfig } from "./config";
-import { routeKey, type Inbound, type OutputRecord } from "./contracts";
-import { VoiceDrafts } from "./discord-voice-draft";
+import { routeKey, type Inbound, type Lane, type OutputRecord } from "./contracts";
+import { CONTEXT_MESSAGES, headReplyContext, startContext, type ContextMessage } from "./discord-voice-context";
+import { VOICE_DRAFT_HEADER, VoiceDrafts, type DraftReaction } from "./discord-voice-draft";
 import type { openVoiceLink } from "./discord-voice-link";
 import type { openLive } from "./openai-live";
 import type { openCodexLive } from "./codex-live";
@@ -14,19 +15,27 @@ const connectProvider: typeof openLive = async (...args) =>
 const connectSubscription: typeof openCodexLive = async (...args) =>
   (await import("./codex-live")).openCodexLive(...args);
 
+/** Read-only HEAD state a headContext voice session may share; credentials are redacted from it. */
+export type VoiceHeadSource = { readonly lanes: () => readonly Lane[]; readonly secrets: readonly string[] };
+
+/** Gateway-authored notices are not HEAD output; keep them out of the shared conversation. */
+const NOTICE = /^(?:Voice (?:ready|is off|stopped|session ended)|A voice session|Start subscription voice|For one minute|Use \/voice|No matching active voice draft|Join the configured voice|A separate voice provider key|Could not open)/;
+
 /** One explicitly started session on the existing Gateway client. No background rejoin or paid retries. */
 export class DiscordVoice {
   private session?: AbortController;
-  private drafts = new VoiceDrafts();
+  private readonly drafts: VoiceDrafts;
   private readonly awaitingText = new Map<string, string>();
-  private notifyReply?: () => void;
-  private shareUntil = 0;
+  private notifyReply?: (text?: string) => void;
   private lastCommand = 0n;
   private readonly startedAt = Date.now();
 
   constructor(private readonly config: DiscordVoiceConfig, private readonly owner: string,
     private readonly apiKey: string | undefined, private readonly report: (error: unknown) => void, private readonly link = connectDiscord,
-    private readonly live = connectProvider, private readonly subscription = connectSubscription) {}
+    private readonly live = connectProvider, private readonly subscription = connectSubscription,
+    private readonly head?: VoiceHeadSource) {
+    this.drafts = new VoiceDrafts(config.headContext === true);
+  }
 
   static isControl(text: string): boolean { return /^\/voice(?:\s|$)/i.test(text.trim()); }
 
@@ -51,19 +60,24 @@ export class DiscordVoice {
     if (control === "/voice stop") {
       this.close();
       this.notice(channel, "Voice is off.");
-    } else if (control === "/voice share" && this.config.auth === "subscription") {
-      if (!this.session || !this.notifyReply) this.notice(channel, "Start subscription voice before sharing a work draft.");
-      else {
-        this.shareUntil = performance.now() + 60_000;
-        this.notice(channel, "For one minute, the next voice work draft may be posted here. Speak the task now. Posting is not approval.");
-      }
     } else if (control === "/voice start") {
       if (this.session) this.notice(channel, "A voice session is already starting or active.");
       else void this.start(channel).catch(() => this.report(new Error("Discord voice startup failed")));
     } else this.notice(channel, this.config.auth === "subscription"
-      ? "Use /voice start or /voice stop. Use /voice share before dictating one work draft for this channel."
+      ? "Use /voice start or /voice stop. A work request you speak is posted here as a draft; react \u2705 to it or reply /voice confirm to submit it."
       : "Use /voice start or /voice stop. Voice uses paid OpenAI Live audio.");
     return null;
+  }
+
+  /**
+   * Only called for a fresh reaction-add by the configured text channel's allowlisted guild. Returns the confirmed
+   * work for head intake, or null when the reaction is not the owner's \u2705 on the one active, unexpired draft.
+   */
+  reaction(reaction: DraftReaction, input: Inbound): string | null {
+    if (reaction.channelId !== this.config.textChannelId || reaction.userId !== this.owner) return null;
+    const work = this.drafts.consumeReaction(reaction);
+    if (work) this.awaitingText.set(input.id, routeKey(input.route));
+    return work;
   }
 
   private async start(text: TextChannel): Promise<void> {
@@ -80,13 +94,14 @@ export class DiscordVoice {
     signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
     try {
       const config = this.config;
-      let connect: (handlers: Parameters<typeof openLive>[1]) => ReturnType<typeof openLive>;
+      let connect: (handlers: Parameters<typeof openLive>[1], headContext?: string) => ReturnType<typeof openLive>;
       if (config.auth === "subscription") {
-        connect = handlers => this.subscription({ voice: config.voice }, handlers, signal);
+        connect = (handlers, headContext) => this.subscription({ voice: config.voice, headContext }, handlers, signal);
       } else {
         const apiKey = this.apiKey;
         if (!apiKey) { finish("A separate voice provider key is required. No Live session was opened."); return; }
-        connect = handlers => this.live({ model: config.model, backendModel: config.backendModel, voice: config.voice, apiKey }, handlers, signal);
+        connect = (handlers, headContext) => this.live(
+          { model: config.model, backendModel: config.backendModel, voice: config.voice, apiKey, headContext }, handlers, signal);
       }
       const channel = await text.guild.channels.fetch(this.config.channelId);
       if (signal.aborted) return;
@@ -101,24 +116,25 @@ export class DiscordVoice {
         ended,
       }, signal);
       if (signal.aborted) { activeLink.close(); return; }
+      const headContext = config.headContext && this.head ? await this.snapshot(text, this.head) : undefined;
+      if (signal.aborted) { activeLink.close(); return; }
       provider = await connect({
         audio: pcm => { if (!signal.aborted) activeLink.play(pcm); },
         interrupt: () => activeLink.clear(), ended,
         forward: async request => {
           signal.throwIfAborted();
-          if (config.auth === "subscription") {
-            if (!this.shareUntil || performance.now() >= this.shareUntil) throw new Error("No written permission to share a voice draft");
-            this.shareUntil = 0;
-          }
           await this.drafts.propose(text, this.owner, request, signal);
           return "Draft posted for written confirmation. Not yet submitted to HEAD or executed.";
         },
-      });
+      }, headContext);
       if (signal.aborted) { provider.close(); return; }
-      this.notifyReply = () => provider?.notifyHeadReply();
-      this.notice(text, config.auth === "subscription"
-        ? "Voice ready. Audio goes to OpenAI using your Codex subscription. To post one work draft here, type /voice share before dictating it. Use /voice stop to disconnect."
-        : "Voice ready. Your audio goes to OpenAI Live. Use /voice stop to disconnect.");
+      this.notifyReply = reply => provider?.notifyHeadReply(reply);
+      const shared = headContext === undefined ? ""
+        : " Recent text in this channel and open lane titles/states were also sent to OpenAI, and HEAD's replies here will be while voice is on.";
+      this.notice(text, (config.auth === "subscription"
+        ? "Voice ready. Audio goes to OpenAI using your Codex subscription."
+        : "Voice ready. Your audio goes to OpenAI Live.") +
+        " A work request you speak is posted here as a draft; react \u2705 to it or reply /voice confirm to submit it. Use /voice stop to disconnect." + shared);
     } catch {
       // Never send SDK errors, bearer headers, owner audio, or transcripts to Discord/logs.
       finish(this.config.auth === "subscription"
@@ -127,22 +143,52 @@ export class DiscordVoice {
     }
   }
 
+  /** Bounded recent owner/HEAD text plus open lane status; a failed read degrades to what is available. */
+  private async snapshot(text: TextChannel, head: VoiceHeadSource): Promise<string> {
+    const messages: ContextMessage[] = [];
+    try {
+      const botId = text.client.user?.id;
+      for (const message of [...(await text.messages.fetch({ limit: CONTEXT_MESSAGES })).values()].reverse()) {
+        if (message.webhookId || !message.content ||
+          (message.type !== MessageType.Default && message.type !== MessageType.Reply)) continue;
+        if (message.author.id === this.owner && !message.author.bot) {
+          if (!DiscordVoice.isControl(message.content)) messages.push({ from: "owner", text: message.content });
+        } else if (botId && message.author.id === botId && !message.content.startsWith(VOICE_DRAFT_HEADER) &&
+          !NOTICE.test(message.content)) messages.push({ from: "HEAD", text: message.content });
+      }
+    } catch {
+      this.report(new Error("Voice HEAD context could not read recent channel messages"));
+    }
+    let lanes: readonly Lane[] = [];
+    try {
+      lanes = head.lanes();
+    } catch {
+      this.report(new Error("Voice HEAD context could not read lane status"));
+    }
+    return startContext(messages, lanes, head.secrets);
+  }
+
   private notice(channel: TextChannel, content: string): void {
     void channel.send({ content, allowedMentions: { parse: [] } }).catch(() => this.report(new Error("Discord voice notice delivery failed")));
   }
 
   textDelivered(output: OutputRecord): void {
-    if (this.awaitingText.get(output.sourceId) !== routeKey(output.route)) return;
-    this.awaitingText.delete(output.sourceId);
+    const confirmed = this.awaitingText.get(output.sourceId) === routeKey(output.route);
+    if (confirmed) this.awaitingText.delete(output.sourceId);
+    let reply: string | undefined;
+    if (this.config.headContext && this.head) {
+      const { route } = output;
+      if (route.platform !== "discord" || route.channelId !== this.config.textChannelId || route.threadId !== null) return;
+      reply = headReplyContext(output.text, this.head.secrets) ?? undefined;
+    } else if (!confirmed) return;
     // Discord delivery succeeded; a best-effort spoken notice cannot change that outcome.
-    try { this.notifyReply?.(); } catch { this.report(new Error("Voice reply notification failed")); }
+    try { this.notifyReply?.(reply); } catch { this.report(new Error("Voice reply notification failed")); }
   }
 
   close(): void {
     const session = this.session;
     this.session = undefined;
     this.notifyReply = undefined;
-    this.shareUntil = 0;
     this.awaitingText.clear();
     session?.abort();
     this.drafts.clear();
