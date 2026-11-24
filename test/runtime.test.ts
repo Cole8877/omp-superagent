@@ -2252,6 +2252,22 @@ describe("source-bound Discord topic management", () => {
     expect(messenger.threads).toEqual([]);
   });
 
+  test("an interrupted lane whose recorded Host exited does not hold a host slot", async () => {
+    const { runtime, store, config, launched, errors } = fixture(2);
+    const exited = Bun.spawn([process.execPath, "--version"], { stdout: "ignore" });
+    await exited.exited;
+    const stale = savedLane(store, config, "stale-owner", route("125"), exited.pid);
+    store.updateLane(stale.id, stale.generation, { workState: "paused", runtimeState: "interrupted" });
+    const lane = savedLane(store, config, "queued-work", route("126"));
+    store.receive(message("1750000000000000453", lane.route), lane.id);
+    await runtime.start();
+    await runtime.kick();
+
+    expect(launched.map(options => options.socketPath)).toEqual([lane.socketPath]);
+    expect(store.lane(stale.id)).toMatchObject({ workState: "paused", pid: exited.pid });
+    expect(errors).toEqual([]);
+  });
+
   test("a queued parent follow-up keeps its report in the existing thread after controller restart", async () => {
     const { runtime, store, config, main, directory, launched, errors } = fixture(1);
     const lane = savedLane(store, config, "queued-reopen", route("124"));

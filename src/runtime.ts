@@ -1811,9 +1811,11 @@ export class Superagent {
   }
 
   private mayOwnHost(lane: Lane): boolean {
-    return lane.pid !== null || (lane.remote
-      ? lane.generation > 0 && lane.runtimeState !== "unloaded"
-      : existsSync(lane.socketPath));
+    // A local lane whose recorded Host exited and left no socket is the same
+    // verified exit `release` accepts; its stale PID must not hold a host slot.
+    return lane.remote
+      ? lane.pid !== null || lane.generation > 0 && lane.runtimeState !== "unloaded"
+      : existsSync(lane.socketPath) || lane.pid !== null && this.pidAlive(lane.pid);
   }
 
   private async inspectRemote(lane: Lane, reconcileOpen = false): Promise<RemoteInspection> {
