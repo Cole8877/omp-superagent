@@ -5905,8 +5905,11 @@ export class Superagent {
           }
         }
       } else {
-        if (this.restartFence()?.requestId !== restart.requestId) return;
-        this.saveRestart({ ...restart, state: "failed" });
+        // checkpointRestart may have saved a checkpoint before throwing; keep
+        // the durable fence so a fresh /restart reuses it instead of re-snapshotting.
+        const current = this.restartFence();
+        if (current?.requestId !== restart.requestId) return;
+        this.saveRestart({ ...current, state: "failed" });
         this.restartResult(restart, "Restart checkpoint could not be confirmed. Inspect the original HEAD ownership, native work and cancelled approval receipts. Intake remains durable and held; no shutdown or prompt replay was attempted. Send a new /restart to retry the checkpoint.");
         this.report(error);
       }

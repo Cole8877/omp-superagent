@@ -6761,6 +6761,25 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(main.commands.some(command => command.type === "shutdown_host")).toBe(false);
   });
 
+  test("a retried restart keeps the checkpoint saved before a later checkpoint failure", async () => {
+    const { runtime, main, store, requests } = restartFixture();
+    await runtime.start();
+    main.state.goal = { enabled: true, mode: "active", goal: { id: "original-head-goal", status: "active" } };
+    main.state.isStreaming = true;
+    main.abortFails = true;
+    const original = message("restart-abort-failed", route(), "/restart");
+    await admit(runtime, original);
+    const first = JSON.parse(store.getMeta("head:restart-fence")!);
+    expect(first.state).toBe("failed");
+    expect(first.checkpoint).toMatchObject({ goalActive: true, goalId: "original-head-goal" });
+    main.abortFails = false;
+    const next = message("restart-after-abort-failure", route(), "/restart");
+    await admit(runtime, next);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.inputId).toBe(next.id);
+    expect(JSON.parse(store.getMeta("head:restart-fence")!)).toMatchObject({ state: "accepted", checkpoint: { goalActive: true, goalId: "original-head-goal" } });
+  });
+
   test.each(["pending", "submitted", "uncertain"] as const)("durable %s work in either HEAD or a lane survives restart admission without replay", async state => {
     for (const target of ["main", "lane"] as const) {
       const { runtime, store, config, requests } = restartFixture();
