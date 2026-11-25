@@ -2493,6 +2493,41 @@ describe("source-bound Discord topic management", () => {
     expect(messenger.threads).toEqual([]);
   });
 
+  test("an interrupted lane whose recorded Host exited does not hold a host slot", async () => {
+    const { runtime, store, config, launched, errors } = fixture(2);
+    const exited = Bun.spawn([process.execPath, "--version"], { stdout: "ignore" });
+    await exited.exited;
+    const stale = savedLane(store, config, "stale-owner", route("125"), exited.pid);
+    const unresolved = message("1750000000000000454", stale.route);
+    const pending = message("1750000000000000455", stale.route);
+    store.receive(unresolved, stale.id);
+    store.submit(unresolved.id, "prior-run", stale.generation);
+    store.settle(unresolved.id, "uncertain");
+    store.receive(pending, stale.id);
+    store.putApproval({ id: "prior-approval", target: stale.id, generation: stale.generation, requestId: "prior-ui", route: stale.route,
+      request: { method: "confirm" }, state: "pending", remoteId: "prior-card" });
+    store.updateLane(stale.id, stale.generation, { workState: "paused", runtimeState: "interrupted" });
+    await runtime.start();
+
+    // Once the verified exit is recorded, a subsequent occupant of the old
+    // PID cannot re-reserve the slot or change the old lane's work holds.
+    const kill = process.kill.bind(process);
+    const probe = spyOn(process, "kill").mockImplementation((pid, signal) => pid === exited.pid && signal === 0 || kill(pid, signal));
+    try {
+      const lane = savedLane(store, config, "queued-work", route("126"));
+      store.receive(message("1750000000000000453", lane.route), lane.id);
+      await runtime.kick();
+      expect(launched.map(options => options.socketPath)).toEqual([lane.socketPath]);
+    } finally { probe.mockRestore(); }
+
+    expect(store.lane(stale.id)).toMatchObject({ generation: stale.generation, sessionId: stale.sessionId,
+      workState: "paused", runtimeState: "interrupted", pid: null });
+    expect(store.input(unresolved.id)?.state).toBe("uncertain");
+    expect(store.input(pending.id)?.state).toBe("pending");
+    expect(store.approval("prior-approval")).toMatchObject({ state: "pending", remoteId: "prior-card" });
+    expect(errors).toEqual([]);
+  });
+
   test("a queued parent follow-up keeps its report in the existing thread after controller restart", async () => {
     const { runtime, store, config, main, directory, launched, errors } = fixture(1);
     const lane = savedLane(store, config, "queued-reopen", route("124"));
@@ -3217,6 +3252,38 @@ describe("same-HEAD evidence recovery", () => {
       expect(main.prompts.map(prompt => prompt.id)).toEqual([original.id, store.input("after-confirmation")?.requestId ?? "missing"]);
     },
   );
+
+  test("a transient final state read failure does not strand a completed HEAD prompt", async () => {
+    const { runtime, main, store, messenger, errors } = fixture();
+    const original = headMessage("completed-readback", route("original-route"));
+    await runtime.start();
+    await admit(runtime, original);
+    await main.whenPrompts(1);
+    const requestId = store.input(original.id)?.requestId;
+    if (!requestId) throw new Error("Missing original native admission");
+
+    let reads = 0;
+    const failed = new Error("Transient native state read failure");
+    main.beforeState = () => { if (++reads === 1) throw failed; };
+    main.complete("Native work is complete.");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(errors).toContain(failed);
+    expect(reads).toBe(1);
+    expect(store.input(original.id)?.state).toBe("submitted");
+    expect(store.output(`${original.id}:answer`)).toBeNull();
+
+    // There is no further native frame. The ordinary pump wake rechecks only
+    // verified settlement and publishes a single answer on the original route.
+    await runtime.kick();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(reads).toBe(2);
+    expect(store.input(original.id)?.state).toBe("done");
+    expect(store.output(`${original.id}:answer`)?.state).toBe("sent");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([requestId]);
+    expect(messenger.attempted).toHaveLength(1);
+    expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route, text: "Native work is complete.",
+      replyTo: { route: original.route, messageId: original.messageId } }]);
+  });
 
   test("a failed final state read and failed card presentation do not strand HEAD", async () => {
     const instance = fixture();
@@ -6539,6 +6606,14 @@ function savedLane(store: Store, config: Config, id: string, destination: Route,
   return lane;
 }
 
+function markMockHostEndpoint(host: HostTransport, path: string): void {
+  // The fake connect adapter supplies the transport; its endpoint is observable
+  // to residency checks only until the mock Host disconnects at shutdown.
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "");
+  void host.exited.then(() => rmSync(path, { force: true }));
+}
+
 function legacyLane(store: Store, config: Config, id: string, destination: Route, pid: number | null = null): Lane {
   const { model: _model, modelReason: _reason, modelPreset: _preset, modelPresetSnapshot: _snapshot, ...old } = savedLane(store, config, id, destination, pid);
   const db = new Database(join(config.stateDir, "coordination.sqlite"));
@@ -6720,7 +6795,7 @@ describe("controlled Gateway AND HEAD restart", () => {
     }
   });
 
-  test("only a fresh owner restart can take over a checkpoint blocked before handoff", async () => {
+  test.each(["saved", "missing"] as const)("only a fresh owner restart can take over a checkpoint blocked before handoff (%s)", async snapshot => {
     const { runtime, main, store, requests } = restartFixture();
     await runtime.start();
     main.state.hasOwnedRunningWork = true;
@@ -6728,11 +6803,22 @@ describe("controlled Gateway AND HEAD restart", () => {
     await admit(runtime, original);
     const first = JSON.parse(store.getMeta("head:restart-fence")!);
     expect(first.state).toBe("checkpoint-blocked");
+    if (snapshot === "missing") {
+      delete first.checkpoint;
+      store.setMeta(`head:restart:${original.id}`, JSON.stringify(first));
+      store.setMeta("head:restart-fence", JSON.stringify(first));
+    }
     main.state.hasOwnedRunningWork = false;
     await admit(runtime, original);
     expect(requests).toHaveLength(0);
     const next = message("restart-after-job-drained", route("other-owner-room"), "/restart");
     await admit(runtime, next);
+    if (snapshot === "missing") {
+      expect(requests).toHaveLength(0);
+      expect(store.input(next.id)?.state).toBe("cancelled");
+      expect(JSON.parse(store.getMeta("head:restart-fence")!)).toEqual(first);
+      return;
+    }
     expect(requests).toHaveLength(1);
     expect(requests[0]?.inputId).toBe(next.id);
     expect(requests[0]?.requestId).not.toBe(first.requestId);
@@ -6778,6 +6864,62 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0]?.inputId).toBe(next.id);
     expect(JSON.parse(store.getMeta("head:restart-fence")!)).toMatchObject({ state: "accepted", checkpoint: { goalActive: true, goalId: "original-head-goal" } });
+  });
+
+  test.each(["fresh retry", "operator stop"] as const)("a late HEAD checkpoint read failure preserves the durable snapshot for %s", async outcome => {
+    const { runtime, main, store, requests } = restartFixture();
+    main.journalLeaf = true;
+    await runtime.start();
+    const work = headMessage("restart-late-failure-work", route("original-work-room"));
+    await admit(runtime, work);
+    const nativeId = main.prompts[0]!.id;
+    const goal = { id: "restart-late-failure-goal", status: "active" as const };
+    main.state.goal = { enabled: true, mode: "active", goal };
+    main.emit({ type: "goal_updated", state: main.state.goal });
+
+    // The final read occurs after the checkpoint is durable, the goal is
+    // paused, and the original admission has been cleared from live HEAD.
+    let checkpoint: unknown;
+    main.beforeState = () => {
+      if (store.input(work.id)?.state !== "uncertain") return;
+      main.beforeState = undefined;
+      checkpoint = JSON.parse(store.getMeta("head:restart-fence")!).checkpoint;
+      if (outcome === "operator stop") store.setMeta("gateway:operator-stop", "newer-stop-during-final-read");
+      throw new Error("Isolated checkpoint final read failure");
+    };
+    const original = message("restart-late-failure", route(), "/restart");
+    await admit(runtime, original);
+    expect(main.state.goal?.goal).toMatchObject({ id: goal.id, status: "paused" });
+    expect(checkpoint).toMatchObject({ goalActive: true, goalId: goal.id, goalSourceId: work.id,
+      residents: [expect.objectContaining({ id: "main", inputId: work.id, requestIds: [nativeId], entryId: `user-${nativeId}` })] });
+    const saved = JSON.parse(store.getMeta(`head:restart:${original.id}`)!);
+    expect(saved.checkpoint).toEqual(checkpoint);
+    if (outcome === "operator stop") {
+      expect(saved.state).toBe("refused");
+      expect(store.getMeta("head:restart-fence")).toBe("");
+      expect(store.output(`${original.id}:restart-result`)).toMatchObject({
+        state: "sent", sourceId: original.id, route: original.route, text: expect.stringContaining("Explicit operator stop superseded"),
+      });
+      expect(requests).toEqual([]);
+      return;
+    }
+    const failed = JSON.parse(store.getMeta("head:restart-fence")!);
+    expect(failed.state).toBe("failed");
+    expect(failed).toEqual(saved);
+    await admit(runtime, original);
+    expect(requests).toEqual([]);
+
+    const next = message("restart-after-late-failure", route("other-owner-room"), "/restart");
+    await admit(runtime, next);
+    expect(requests).toEqual([{ requestId: expect.any(String), inputId: next.id, ackOutputId: `${next.id}:restart-ack` }]);
+    expect(requests[0]?.requestId).not.toBe(failed.requestId);
+    const accepted = JSON.parse(store.getMeta("head:restart-fence")!);
+    expect(accepted.state).toBe("accepted");
+    expect(accepted.checkpoint).toEqual(checkpoint);
+    expect(store.input(work.id)).toMatchObject({ state: "uncertain", requestId: nativeId });
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([nativeId]);
+    expect(main.abortCount).toBe(1);
+    expect(main.commands.some(command => command.type === "shutdown_host")).toBe(false);
   });
 
   test.each(["pending", "submitted", "uncertain"] as const)("durable %s work in either HEAD or a lane survives restart admission without replay", async state => {
@@ -7017,11 +7159,19 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(store.input("later-direct")?.state).toBe("pending");
   });
 
-  test.each(["rejected", "uncertain"] as const)("%s ACK delivery never hands off or retries the original restart", async certainty => {
-    const { runtime, store, messenger, requests } = restartFixture();
+  test.each([
+    ["discord", "rejected"], ["discord", "uncertain"], ["kakao", "uncertain"],
+  ] as const)("%s %s ACK delivery never hands off or retries the original restart", async (platform, certainty) => {
+    const { runtime, config, store, messenger, requests } = restartFixture();
+    const kakao = { bridgeUrl: "http://127.0.0.1:8080", tokenEnv: "TEST_KAKAO",
+      botUserId: "900", ownerId: "42", chatId: "777" };
+    if (platform === "kakao") config.kakao = kakao;
+    const destination = platform === "kakao" ? route(null, {
+      platform, accountId: kakao.botUserId, authorityId: kakao.ownerId, guildId: null, channelId: kakao.chatId,
+    }) : route();
     messenger.sendError = new DeliveryError("secret transport response", certainty);
     await runtime.start();
-    const original = message(`restart-ack-${certainty}`, route(), "/restart");
+    const original = message(`restart-ack-${certainty}`, destination, "/restart");
     await admit(runtime, original);
     expect(store.output(`${original.id}:restart-ack`)?.state).toBe(certainty === "rejected" ? "failed" : "uncertain");
     messenger.sendError = undefined;
@@ -9654,6 +9804,7 @@ describe("explicit lane-local model changes", () => {
         { model: "fixture/efficient", role: "fallback", fallback: origin === "verified fallback" }]);
       legacyTranscript(lane, executionModel);
       hosts.set(lane.socketPath, host);
+      markMockHostEndpoint(host, lane.socketPath);
       const quotaKey = `lane-quota-hold:${lane.id}`;
       store.setMeta(quotaKey, "held-native-work");
       await runtime.start();
@@ -10858,6 +11009,7 @@ describe("authoritative per-lane model selection", () => {
     host.state.hostPid = exitedPid;
     recordedModelChanges(host, journal);
     hosts.set(lane.socketPath, host);
+    markMockHostEndpoint(host, lane.socketPath);
     mkdirSync(dirname(lane.sessionFile), { recursive: true });
     writeFileSync(lane.sessionFile, JSON.stringify({ type: "session", version: 3, id: host.state.sessionId, cwd: lane.cwd }) + "\n");
 

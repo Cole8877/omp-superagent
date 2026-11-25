@@ -140,10 +140,11 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
   route before handing off the restart. Checkpoint with native APIs: cancel the
   head's pending cards by their original IDs, abort/clear queued native work,
   pause the active head goal and cancel and reap the root's native background
-  jobs. Cancellation alone is not an exit receipt. If the final checkpoint is
-  still busy, a **new** owner `/restart` can continue from the saved checkpoint
-  on that same head; a duplicate command or uncertain handoff cannot. Require
-  actual quiescence before shutdown; never signal a PID to bypass ownership.
+  jobs. Cancellation alone is not an exit receipt. If checkpointing fails
+  before Gateway handoff or final readback still finds HEAD busy, a **new**
+  owner `/restart` on the same head can retry using any checkpoint already
+  saved. A duplicate command or uncertain handoff cannot. Require actual
+  quiescence before shutdown; never signal a PID to bypass ownership.
 - Bind one durable lifecycle request to the original owner input, acknowledgement
   and current process identity. Duplicate delivery does not start another replacement.
   Compatible edits to runtime limits or the default model can take effect on
@@ -161,6 +162,9 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
   keeps intake held; a configured default is not evidence of active effort.
   Reconnect to resident lanes within the Host budget only when ownership and
   generation match. Leave out-of-budget Hosts untouched and unloaded lanes unloaded.
+  A detached local lane's recorded residency is retired only after its exact owner
+  PID no longer exists and its socket path is confirmed absent. That releases its
+  slot without changing paused work, queue order or unresolved approvals.
   Restore native admission and outcomes from matching journal evidence, not receipts
   from another run. Held submissions are not replayed. Only a goal active before the
   restart with a verified original source can resume through native goal resume;

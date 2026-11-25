@@ -1916,7 +1916,7 @@ export class Superagent {
       const inspection = await this.inspectRemote(lane);
       if (inspection.probe.socket) live = await this.attachLane(lane, inspection);
       else if (!this.recordRemoteExit(lane, inspection.probe)) throw new Error(`Lane ${id} remote ownership is unresolved`);
-    } else if (!live && !lane.remote && (existsSync(lane.socketPath) || lane.pid !== null && this.pidAlive(lane.pid))) {
+    } else if (!live && !lane.remote && this.mayOwnHost(lane)) {
       live = await this.attachLane(lane);
     }
     const current = this.requireLane(id);
@@ -2256,9 +2256,20 @@ export class Superagent {
   }
 
   private mayOwnHost(lane: Lane): boolean {
-    return lane.pid !== null || (lane.remote
-      ? lane.generation > 0 && lane.runtimeState !== "unloaded"
-      : existsSync(lane.socketPath));
+    if (lane.remote) return lane.pid !== null || lane.generation > 0 && lane.runtimeState !== "unloaded";
+    return this.live.has(lane.id) || this.connecting.has(lane.id) || !this.recordLocalExit(lane);
+  }
+
+  private recordLocalExit(lane: Lane): boolean {
+    if (lane.pid !== null && this.pidAlive(lane.pid) || this.localSocketMayExist(lane.socketPath)) return false;
+    // Forget the verified dead owner before releasing its budget slot. Otherwise
+    // reuse of its numeric PID by an unrelated process can claim the slot again.
+    return lane.pid === null || this.store.retireLocalLaneHost(lane);
+  }
+
+  private localSocketMayExist(path: string): boolean {
+    try { lstatSync(path); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   }
 
   private async inspectRemote(lane: Lane, reconcileOpen = false): Promise<RemoteInspection> {
@@ -4866,6 +4877,8 @@ export class Superagent {
         return { platform: "slack", supported: false, reason: "Socket Mode bots cannot set their online dot via the Slack Events API. Configure bot presence in the Slack app settings." };
       case "telegram":
         return { platform: "telegram", supported: false, reason: "The Telegram Bot API does not expose bot online presence." };
+      case "kakao":
+        return { platform: "kakao", supported: false, reason: "KakaoTalk has no bot presence; the bridge account's own status applies." };
       case "discord":
         if (!this.messenger.messengerPresence) throw new Error("This Gateway does not support Discord presence");
         return this.messenger.messengerPresence({ sourceId, action, route: source.route });
@@ -5142,8 +5155,11 @@ export class Superagent {
       let live = this.live.get(id);
       let remoteTranscript = false;
       let remoteOwnerAbsent = false;
-      if (this.blocked.has(id) && this.residentHosts().size > this.config.maxHosts)
-        throw new Error("Existing native ownership exceeds the host budget; reconcile it before resuming");
+      if (this.blocked.has(id)) {
+        if (this.residentHosts().size > this.config.maxHosts)
+          throw new Error("Existing native ownership exceeds the host budget; reconcile it before resuming");
+        lane = this.requireLane(id); // Capacity reconciliation may have retired the recorded local PID.
+      }
       if (!live && lane.remote && (this.mayOwnHost(lane) || this.remoteOpenPending(lane)
         || this.blocked.has(id) || source && lane.sessionId !== null)) {
         if (this.connecting.has(id) && lane.runtimeState === "starting")
@@ -5269,7 +5285,7 @@ export class Superagent {
       }
       if (outcome === "cancelled") await this.stopPausedLane(id);
       if (!lane.remote || !live) live = this.live.get(id);
-      if (!live && !lane.remote && this.mayOwnHost(lane))
+      if (!live && !lane.remote && this.mayOwnHost(this.requireLane(id)))
         throw new Error("Cannot close a lane whose native ownership/state is unresolved");
       if (live && (!(await this.state(live)).isSettled || live.input)) throw new Error("Lane still owns unresolved native work");
       this.assertRestartOpen();
@@ -5386,7 +5402,8 @@ export class Superagent {
     const existing = this.live.get(lane.id);
     if (existing) return existing.releasing || this.remoteShutdownPending(lane) ? null : existing;
     if ((this.blocked.has(lane.id) && !modelReadback && authorizedResume === undefined) || this.connecting.has(lane.id)) return null;
-    if (!this.residentHosts().has(lane.id) && this.residentHosts().size + Number(this.groups?.running ?? false) >= this.config.maxHosts) {
+    const resident = this.residentHosts();
+    if (!resident.has(lane.id) && resident.size + Number(this.groups?.running ?? false) >= this.config.maxHosts) {
       const candidates = [...this.live.values()].filter(host => host.id !== "main" && !host.input && !host.busy)
         .sort((left, right) => left.lastActivity - right.lastActivity);
       let released = false;
@@ -5394,6 +5411,9 @@ export class Superagent {
       if (!released) return null;
       if (this.residentHosts().size + Number(this.groups?.running ?? false) >= this.config.maxHosts) return null;
     }
+    const checked = this.requireLane(lane.id);
+    if (checked.generation !== lane.generation || this.live.has(lane.id) || this.connecting.has(lane.id)) return null;
+    lane = checked; // Capacity reconciliation may have retired the recorded local PID.
     this.connecting.add(lane.id);
     const restoringResumed = (workState: Lane["workState"]) => (workState === "paused" || workState === "completed")
       && authorizedResume !== undefined && (this.pauseRevisions.get(lane.id) ?? 0) === authorizedResume;
@@ -5402,7 +5422,7 @@ export class Superagent {
       if (!explicitRetry) this.assertPassiveModelReconciliation(lane.id, this.modelIntent(lane.id));
       if (lane.remote) this.requireRemoteCommandPolicy();
       const remote = lane.remote ? await this.inspectRemote(lane) : undefined;
-      if (remote ? remote.probe.socket : existsSync(lane.socketPath)) {
+      if (remote ? remote.probe.socket : this.localSocketMayExist(lane.socketPath)) {
         preflight = false;
         if (this.remoteShutdownPending(lane)) return null;
         scopedReadback?.assertSelected(this.requireLane(lane.id));
@@ -5415,7 +5435,7 @@ export class Superagent {
         if (!modelReadback) await this.checkLaneModel(live);
         return live;
       }
-      if (remote ? !this.recordRemoteExit(lane, remote.probe) : lane.pid !== null && this.pidAlive(lane.pid))
+      if (remote ? !this.recordRemoteExit(lane, remote.probe) : !this.recordLocalExit(lane))
         throw new Error(`Lane ${lane.id} process is alive or ownership/transcript is unknown; refusing duplicate launch`);
       if (this.remoteOpenPending(lane) && authorizedResume === undefined) return null;
       if (remote && !await this.adapters.workerPlacementReady(remote.registration, workerRef(lane)))
@@ -5552,7 +5572,7 @@ export class Superagent {
           const { probe } = await this.inspectRemote(lane);
           if (!this.current(live) || !this.recordRemoteExit(lane, probe)) return false;
         } catch (error) { this.report(error); return false; }
-      } else if (this.pidAlive(lane.pid) || existsSync(lane.socketPath)) return false;
+      } else if (this.pidAlive(lane.pid) || this.localSocketMayExist(lane.socketPath)) return false;
       this.live.delete(live.id);
       live.unsubscribe();
       await live.connection.close();
@@ -5609,8 +5629,7 @@ export class Superagent {
       ...(input.pickerSelection ? { picker: true } : {}) };
   }
 
-  private restartFence(): HeadRestart | null {
-    const value = this.store.getMeta("head:restart-fence");
+  private restartFence(value = this.store.getMeta("head:restart-fence")): HeadRestart | null {
     if (!value) return null;
     const restart = JSON.parse(value) as HeadRestart;
     if (!restart.inputId || !restart.requestId || !restart.ackOutputId || !Number.isSafeInteger(restart.ownerPid)
@@ -5648,14 +5667,18 @@ export class Superagent {
     if (this.restartFence()) throw new Error("Gateway AND HEAD restart is held or pending; lane and native mutations are fenced");
   }
 
-  private restartResult(restart: HeadRestart, text: string, uncertain = false): void {
+  private restartOutput(restart: HeadRestart, text: string, uncertain = false) {
     const input = this.store.input(restart.inputId);
     if (!input || this.headCommand(input)?.name !== "restart" || this.store.getMeta(`user-source:${input.id}`) !== "true") {
       throw new Error("Restart result has no original authorized owner input");
     }
-    const id = `${input.id}:restart-${uncertain ? "uncertain" : "result"}`;
+    return { id: `${input.id}:restart-${uncertain ? "uncertain" : "result"}`, sourceId: input.id, route: input.route, text };
+  }
+
+  private restartResult(restart: HeadRestart, text: string, uncertain = false): void {
+    const output = this.restartOutput(restart, text, uncertain);
     // The first durable result owns this ID, even after reconnect/startup replay.
-    if (!this.store.output(id)) this.store.queueOutput({ id, sourceId: input.id, route: input.route, text });
+    if (!this.store.output(output.id)) this.store.queueOutput(output);
   }
 
   private refuseRestart(restart: HeadRestart, text: string): void {
@@ -5680,7 +5703,8 @@ export class Superagent {
     // Only a *new* owner command can supersede a restart that stopped before
     // handoff: a checkpoint whose final idle readback was negative, or one that
     // failed before any Gateway receipt. Never repeat an ambiguous handoff.
-    const supersedable = (prior?.state === "checkpoint-blocked" || prior?.state === "failed") && !this.restartActive
+    const supersedable = (prior?.state === "checkpoint-blocked" && !!prior.checkpoint
+      || prior?.state === "failed") && !this.restartActive
       && prior.ownerPid === process.pid && prior.sessionId === live?.sessionId
       && prior.stopBoundary === this.store.getMeta("gateway:operator-stop")
       && !this.store.getMeta(`gateway:restart:${prior.requestId}`);
@@ -5905,13 +5929,18 @@ export class Superagent {
           }
         }
       } else {
-        // checkpointRestart may have saved a checkpoint before throwing; keep
-        // the durable fence so a fresh /restart reuses it instead of re-snapshotting.
-        const current = this.restartFence();
-        if (current?.requestId !== restart.requestId) return;
-        this.saveRestart({ ...current, state: "failed" });
-        this.restartResult(restart, "Restart checkpoint could not be confirmed. Inspect the original HEAD ownership, native work and cancelled approval receipts. Intake remains durable and held; no shutdown or prompt replay was attempted. Send a new /restart to retry the checkpoint.");
-        this.report(error);
+        // checkpointRestart may have saved the original admission and goal
+        // before throwing. Its rejected promise never updates local restart.
+        const fence = this.store.getMeta("head:restart-fence");
+        if (!fence) return;
+        const current = this.restartFence(fence);
+        if (current?.requestId !== restart.requestId || current.inputId !== restart.inputId
+          || current.ownerPid !== restart.ownerPid || current.sessionId !== restart.sessionId
+          || current.sessionFile !== restart.sessionFile
+          || !["checking", "acknowledging", "checkpoint-blocked"].includes(current.state)) return;
+        const output = this.restartOutput(current, "Restart checkpoint could not be confirmed. Inspect the original HEAD ownership, native work and cancelled approval receipts. Intake remains durable and held; no shutdown or prompt replay was attempted. Send a new /restart to retry the checkpoint.");
+        if (this.store.recordRestartCheckpointFailure(fence, current.stopBoundary ?? null,
+          JSON.stringify({ ...current, state: "failed" }), output)) this.report(error);
       }
     } finally {
       if (this.restartActive === input.id) this.restartActive = undefined;
@@ -7663,11 +7692,13 @@ export class Superagent {
           if (live.releasing) {
             await this.release(live);
           } else if (live.id === "main" && live.input && !live.preparing && !live.finishing
-            && live.result?.status === "error" && this.store.input(live.input.id)?.state === "submitted"
-            && !this.store.approvals(live.id).length && this.recoveryControllerIdle()) {
-            // Retry an unavailable state read or silent native UI close on the
-            // existing wake. Never repeat a dialog response or hold the pump.
-            this.background(this.finish(live));
+            && this.store.input(live.input.id)?.state === "submitted") {
+            const completionReadPending = live.settlementReadPending && live.result?.status === "completed"
+              && [...live.admitted.values()].every(({ input, result }) => result || this.store.input(input.id)?.state === "cancelled");
+            // Retry a lost settlement read or confirm a silent native UI close.
+            // Never resubmit a prompt or a dialog response, or hold the pump.
+            if (completionReadPending || live.result?.status === "error"
+              && !this.store.approvals(live.id).length && this.recoveryControllerIdle()) this.background(this.finish(live));
           } else if (live.id !== "main" && live.input && !live.preparing && !live.finishing
             && (live.result || this.store.input(live.input.id)?.state === "cancelled")) {
             // Retry an interrupted settlement read or explicit resolution on

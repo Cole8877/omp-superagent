@@ -8,7 +8,7 @@ import type { RemotePlacement } from "./worker-wire";
 import type { OmpResetAccount } from "./omp-usage";
 
 /** Coordination records only. OMP owns transcripts and execution state. */
-export type Platform = "discord" | "telegram" | "slack";
+export type Platform = "discord" | "telegram" | "slack" | "kakao";
 
 export interface Route {
   platform: Platform;
@@ -449,6 +449,8 @@ export interface StorePort {
   prepareHeadRecovery(attempt: HeadRecoveryAttempt): boolean;
   commitHeadRecovery(expected: HeadRecoveryAttempt, decided: HeadRecoveryAttempt): boolean;
   queueOutput(output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean;
+  recordRestartCheckpointFailure(expectedFence: string, stopBoundary: string | null, failedFence: string,
+    output: Pick<OutputRecord, "id" | "sourceId" | "route" | "text">): boolean;
   recordHeadHoldNotice(blockerId: string, output: Omit<OutputRecord, "state" | "remoteId" | "error" | "editOf">): boolean;
   output(id: string): OutputRecord | null;
   outputs(physicalRoute?: string): OutputRecord[];
@@ -461,6 +463,7 @@ export interface StorePort {
   updateLane(id: string, generation: number, patch: Partial<Pick<Lane,
     "workState" | "runtimeState" | "sessionId" | "pid" | "lastActivityAt" | "result"
   >>): boolean;
+  retireLocalLaneHost(expected: Pick<Lane, "id" | "generation" | "pid" | "sessionId" | "socketPath">): boolean;
   nextGeneration(id: string, pickerRestoreSourceId?: string): Lane;
   adoptLaneModel(id: string, generation: number, model: LaneModel, reason: string): boolean;
   changeLaneModel(id: string, generation: number, expected: LaneModel | null, model: LaneModel, reason: string,
