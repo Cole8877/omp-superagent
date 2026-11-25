@@ -391,7 +391,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
     }
 
     let unloadedTranscript: string | undefined;
-    let changedModelReason: string | undefined;
+    const changedModelReason = "The head explicitly changed this settled lane to the native low text-chat preset.";
     if (modelSelection) {
       await unchangedNativeSettings();
       const closing = await HostConnection.connect(firstLane.socketPath);
@@ -471,7 +471,6 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       await messenger.deliver(modelChangeSource);
       await until(() => delivered(modelChangeSource.id), "explicit model-change source request settlement");
       expect(store.input(modelChangeSource.id)).toMatchObject({ id: modelChangeSource.id, target: "main", state: "done", route });
-      changedModelReason = "The head explicitly changed this settled lane to the native low text-chat preset.";
       await runtime.changeModel({ id: created.id, sourceId: modelChangeSource.id, preset: "low", modelReason: changedModelReason });
       expect(JSON.parse(store.getMeta(`lane-model:${created.id}:receipt:${modelChangeSource.id}`)!)).toMatchObject({
         sourceId: modelChangeSource.id, generation: finalLane.generation, previous: laneModel,
@@ -642,7 +641,7 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       // The frozen role default differs from the later transcript model, and
       // its thinking policy differs from the later transcript effort. Resume
       // must restore both sources independently, not reapply the preset.
-      const pick = async (output: OutputRecord, value: string) => {
+      const pick = async (output: OutputRecord, value: string, target: "head" | "lane" = "head") => {
         const groups = output.picker?.groups ?? [];
         const group = groups.findIndex(entry => entry.options.includes(value));
         const option = groups[group]?.options.indexOf(value) ?? -1;
@@ -650,14 +649,24 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
         const id = `picker:${output.id}`;
         const cardId = store.output(output.id)?.remoteId;
         if (!cardId) throw new Error("The fixture menu has no confirmed delivery receipt");
-        await messenger.deliver({
+        const scoped = output.picker?.kind === "model" && output.picker.modelTargets !== undefined;
+        if (target === "lane" && !scoped) throw new Error("The lane fixture requires a scoped model menu");
+        const selection: Inbound = {
           id, route: output.route, messageId: null, text: "", receivedAt: Date.now(), attachments: [],
-          pickerSelection: { outputId: output.id, cardId, group, option },
-        });
-        await until(() => store.input(id)?.state === "done" && delivered(id), `HEAD applied picker value ${value}`);
+          pickerSelection: { outputId: output.id, cardId, group, option, ...(scoped ? { target } : {}) },
+        };
+        await messenger.deliver(selection);
+        await until(() => delivered(id), `${target} applied picker value ${value}`);
+        return selection;
       };
       const { output: modelPicker } = await commandReply("207", "/model");
+      expect(modelPicker.picker).toMatchObject({ kind: "model", modelTargets: { lane: {
+        id: finalLane.id, generation: finalLane.generation, sessionId: finalLane.sessionId,
+      } } });
       await pick(modelPicker, `${modelFixtureModels.changedDefault.provider}/${modelFixtureModels.changedDefault.id}`);
+      expect(await runtime.inspect(finalLane.id)).toMatchObject({
+        state: { model: modelFixtureModels.changedLane, modelSettings: lowPreset, sessionId: firstLane.sessionId },
+      });
       const { output: effortPicker } = await commandReply("208", "/effort");
       if (stockEffortSelectors) {
         await pick(effortPicker, "auto");
@@ -813,6 +822,42 @@ export async function nativeRuntime(modelSelection = false): Promise<void> {
       expect(nativeResults.length).toBe(laneStopResults);
       expect(messenger.handlers).toBeDefined();
       expect(alive(child.pid!)).toBe(true);
+      await unchangedNativeSettings();
+
+      // The bound paused lane can change its exact model without a prompt or
+      // resuming work. A fresh card can restore the original model; restore its
+      // preset provenance separately for the global-scope and persistence checks.
+      const { output: lanePicker } = await commandReply("312", "/model");
+      const laneSelection = modelFixtureModels.changedDefault;
+      const laneModelKey = `${laneSelection.provider}/${laneSelection.id}`;
+      const laneClick = await pick(lanePicker, laneModelKey, "lane");
+      expect(messenger.sent.filter(output => output.sourceId === laneClick.id)).toMatchObject([
+        { route: threadRoute, text: expect.stringContaining(laneModelKey) },
+      ]);
+      expect(store.lane(finalLane.id)).toMatchObject({ model: laneSelection, workState: "paused",
+        sessionId: firstLane.sessionId, generation: finalLane.generation });
+      expect(await runtime.inspect(finalLane.id)).toMatchObject({
+        modelCheck: { expected: laneSelection, actual: laneSelection, error: null },
+        state: { model: laneSelection, modelSettings: lowPreset, sessionId: firstLane.sessionId,
+          hostPid: finalLane.pid, settingsScope: "session", isSettled: true },
+      });
+      expect(await initial.client.getState()).toMatchObject({
+        model: headBeforeLaneStop.model, modelSettings: headBeforeLaneStop.modelSettings, sessionId: headState.sessionId,
+      });
+      const { output: restorePicker } = await commandReply("313", "/model");
+      await pick(restorePicker, `${modelFixtureModels.changedLane.provider}/${modelFixtureModels.changedLane.id}`, "lane");
+      await messenger.deliver(laneClick);
+      await runtime.kick();
+      expect(messenger.sent.filter(output => output.sourceId === laneClick.id)).toHaveLength(1);
+      expect(await runtime.inspect(finalLane.id)).toMatchObject({
+        modelCheck: { expected: modelFixtureModels.changedLane, actual: modelFixtureModels.changedLane, error: null },
+        state: { model: modelFixtureModels.changedLane, modelSettings: lowPreset, thinkingLevel: Effort.Low },
+      });
+      await runtime.changeModel({ id: finalLane.id, sourceId: changedFollowup.id, preset: "low", modelReason: changedModelReason });
+      expect(store.lane(finalLane.id)).toMatchObject({ model: modelFixtureModels.changedLane, workState: "paused",
+        modelPreset: "low", modelPresetSnapshot: lowPreset, modelReason: changedModelReason,
+        sessionId: firstLane.sessionId, generation: finalLane.generation });
+      expect(nativeResults.length).toBe(laneStopResults);
       await unchangedNativeSettings();
 
       // Only an explicit --global may cross the native settings boundary. All

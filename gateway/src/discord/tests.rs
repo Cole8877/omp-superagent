@@ -31,6 +31,8 @@ mod addressing_tests;
 mod addressing_authority_tests;
 #[path = "tests/addressing_recovery.rs"]
 mod addressing_recovery_tests;
+#[path = "tests/model_picker.rs"]
+mod model_picker_tests;
 #[path = "tests/presence.rs"]
 mod presence_tests;
 
@@ -117,8 +119,9 @@ async fn rest(AxumState(fixture): AxumState<RestFixture>, request: Request) -> R
             json!({"id":id,"guild_id":"77","channel_id":"89","author":{"id":"71","bot":true}})
         }
         ("POST", "/channels/90/messages") => {
+            let components = body.get("components").cloned().unwrap_or_else(|| json!([]));
             fixture.emitted.send((path, body)).unwrap();
-            json!({"id":"701","guild_id":"77","channel_id":"90","author":{"id":"71","bot":true}})
+            json!({"id":"701","guild_id":"77","channel_id":"90","author":{"id":"71","bot":true},"components":components})
         }
         ("GET", "/channels/99") => json!({"id":"99", "type":1, "recipients":[{"id":"42"}]}),
         ("GET", "/channels/98") => {

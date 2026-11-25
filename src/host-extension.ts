@@ -8,10 +8,10 @@ import type { UnitScope } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { lookup as lookupSetting } from "@oh-my-pi/pi-coding-agent/config/registry";
-import { pickDefaultAvailableModel, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { formatModelStringWithRouting, pickDefaultAvailableModel, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { resolveThinkingLevelForModel } from "@oh-my-pi/pi-tui/thinking";
 import { parseSessionEntries, readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { HostChannel, PR_REVIEW_GITHUB_ENV, PR_REVIEW_SYSTEM_PROMPT, indexServiceCompletions, serviceGenerationKey, type Frame, type ServiceUnit } from "./host-protocol";
+import { HostChannel, LANE_MODEL_PROMOTION_RECEIPT, PR_REVIEW_GITHUB_ENV, PR_REVIEW_SYSTEM_PROMPT, indexServiceCompletions, serviceGenerationKey, type Frame, type ServiceUnit } from "./host-protocol";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { fitAbortAndRestoreQueueResponse } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
@@ -21,8 +21,10 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import type { LanePresetSnapshot } from "./contracts";
 import { MANAGED_ULW_ENV } from "./managed-ulw";
 import { verifyHostSuperkit } from "./host-superkit";
+import { isPrReviewInferenceModel, prReviewModelChoices } from "./pr-review-models";
 import { HEAD_ROTATION_GUARD, HEAD_ROTATION_PROBE, type RotationGuardEvent,
   type RotationNative, type RotationProbeEvent } from "./head-rotation";
+import { installReplyVoice } from "./host-reply-voice";
 
 const terminalService = (state: ServiceUnit["state"]) => state === "exited" || state === "failed";
 const serviceGeneration = ({ owner, id, generation, startedAt, restartCount }: ServiceUnit) =>
@@ -33,8 +35,6 @@ const serviceOwner = ({ agent, sessionManager }: ExtensionContext) => {
   return agent.kind === "sub" && agent.id === "advisor" ? `${id}-advisor` : id;
 };
 
-const reviewInferenceApis = new Set(["openai-completions", "openai-responses", "openai-codex-responses",
-  "azure-openai-responses", "anthropic-messages"]);
 const stockAutoresearchTools = ["init_experiment", "run_experiment", "log_experiment", "update_notes"] as const;
 // --no-tools can still leave builtins in the registration catalogue: write
 // on stock 19.0, resolution/QA devices on 19.1. None may be enabled, mounted,
@@ -47,8 +47,6 @@ const reviewSettingValues = {
   "prewalk.auto": "off", "spotlight.experiment.enabled": false, "providers.cacheWarming": "off", "telemetry.otlpExportEnabled": false,
   "dev.autoqa": false,
 } as const;
-const reviewModelAllowed = (model: { api: string; provider: string; transport?: unknown } | undefined) =>
-  model !== undefined && reviewInferenceApis.has(model.api) && model.provider !== "gitlab-duo" && model.transport !== "pi-native";
 class ReviewIsolationError extends Error {}
 
 /** Match the running CLI's own RPC settlement predicate (old and new SDK surface). */
@@ -85,6 +83,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
   const selectedSuperkit = process.env[MANAGED_ULW_ENV];
   const workerAttempt = process.env.OMP_SUPERAGENT_WORKER_ATTEMPT;
   const reviewCwd = process.env.OMP_SUPERAGENT_PR_REVIEW_CWD;
+  let replyVoice: ReturnType<typeof installReplyVoice>;
   if (reviewCwd && PR_REVIEW_GITHUB_ENV.some(name => process.env[name]))
     throw new Error("Static PR review cannot load GitHub credentials from the native profile");
   let loadedSuperkitPath: string | undefined;
@@ -99,6 +98,25 @@ export default function hostExtension(pi: ExtensionAPI): void {
     const root = pi.pi.AgentRegistry.global().get(pi.pi.MAIN_AGENT_ID)?.session;
     if (!(root instanceof pi.pi.AgentSession)) throw new Error("Native root session is unavailable");
     return root;
+  };
+  const flushLaneModel = (session: ReturnType<typeof rootSession>, previousLeaf: string | null, promoting: boolean) => {
+    const journal = session.sessionManager;
+    const model = session.model;
+    const branch = journal.getBranch();
+    const previousIndex = previousLeaf === null ? -1 : branch.findIndex(entry => entry.id === previousLeaf);
+    const modelIndex = branch.findLastIndex(entry => entry.type === "model_change" && (entry.role ?? "default") === "default");
+    const change = branch[modelIndex];
+    if (!model || (previousLeaf !== null && previousIndex === -1) || modelIndex <= previousIndex
+      || change?.type !== "model_change" || change.resolvedModelIsFallback === true
+      || change.model !== formatModelStringWithRouting(model))
+      throw new Error("Lane model journal selection could not be confirmed");
+    if (promoting) {
+      // The stock selector may flatten distinct provider/ID pairs.
+      journal.appendCustomEntry(LANE_MODEL_PROMOTION_RECEIPT, {
+        entryId: change.id, selector: change.model, model: { provider: model.provider, id: model.id },
+      });
+    }
+    journal.flushSync();
   };
   const serviceObservation = (data: Frame) => {
     const root = rootSession();
@@ -171,7 +189,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
   let reviewStream: NativeSession["agent"]["streamFn"] | undefined;
   const reviewPolicy = (session: NativeSession, cwd: string) => {
     const model = session.model;
-    if (!reviewModelAllowed(model) || !model)
+    if (!model || !isPrReviewInferenceModel(model))
       throw new ReviewIsolationError("Static PR review requires a known tool-less inference API, not an external agent harness");
     if (workerAttempt || realpathSync(session.sessionManager.getCwd()) !== cwd)
       throw new ReviewIsolationError("Static PR review workspace identity is unavailable");
@@ -224,12 +242,12 @@ export default function hostExtension(pi: ExtensionAPI): void {
       reviewPolicy(session, cwd);
       // The actual candidate can differ from the selection on provider retry.
       // Reject it before native dispatch, rather than trusting provider naming.
-      if (!reviewModelAllowed(model) || input.tools?.length || input.inactiveTools?.length)
+      if (!isPrReviewInferenceModel(model) || input.tools?.length || input.inactiveTools?.length)
         throw new Error("Static PR review refused a tool-capable provider request");
       const checkedPayload: NonNullable<NonNullable<typeof options>["onPayload"]> = async (payload, current, signal) => {
         const replacement = await options?.onPayload?.(payload, current, signal);
         const outgoing = replacement ?? payload;
-        if (!reviewModelAllowed(current ?? model) || !outgoing || typeof outgoing !== "object"
+        if (!isPrReviewInferenceModel(current ?? model) || !outgoing || typeof outgoing !== "object"
             || ["tools", "functions", "mcp_servers"].some(key => {
               const value = Object.getOwnPropertyDescriptor(outgoing, key)?.value;
               return value !== undefined && (!Array.isArray(value) || value.length !== 0);
@@ -472,6 +490,14 @@ export default function hostExtension(pi: ExtensionAPI): void {
         modelSettings: { modelRoles: roles, ...(defaultThinkingLevel !== undefined ? { defaultThinkingLevel } : {}) } } };
   };
   const handle = async (command: Frame): Promise<unknown> => {
+    if (command.type === "stage_reply_voice" || command.type === "clear_reply_voice") {
+      exact();
+      if (!replyVoice || typeof command.token !== "string" || !command.token)
+        throw new Error("Native reply voice control is unavailable");
+      if (command.type === "stage_reply_voice") return { staged: replyVoice.stage(command) };
+      replyVoice.clear(command.token);
+      return {};
+    }
     if (command.type === "get_head_rotation") {
       const state = rotationState();
       if (!state) return null;
@@ -515,6 +541,7 @@ export default function hostExtension(pi: ExtensionAPI): void {
     }
     if (command.type === "interrupt_maintenance") {
       const { session } = exact();
+      replyVoice?.clear();
       const restored = command.restoreQueue === true ? session.clearQueue({ forInterrupt: true }) : undefined;
       // abort() raises its barrier and withdraws marked internal context before
       // its first await. Do not await its compaction cleanup until the owner has
@@ -567,11 +594,69 @@ export default function hostExtension(pi: ExtensionAPI): void {
       // Only an owner that implements the cursor command can advertise it to peers.
       return { ...ownerIdentity(ownership.identity), loadedSuperkitPath, prReviewPolicy, settingsScope: "session", modelSettings: snapshot(),
         journalCursorControlVersion: 1,
+        ...(replyVoice?.available() ? { replyVoiceControlVersion: 2 } : {}),
         hasOwnedRunningWork: ownership.unknown ? undefined : ownership.busy, mutationHeld, observationHeld,
         admitted: ownership.identity.session.hasAdmittedSubmission,
         postPromptWork: ownership.identity.session.hasPostPromptWork,
         ...(typeof ownership.identity.session.configuredThinkingLevel === "function"
           ? { configuredThinkingLevel: ownership.identity.session.configuredThinkingLevel() ?? null } : {}) };
+    }
+    if (command.type === "set_lane_model") {
+      if (reviewCwd || process.env.OMP_SUPERAGENT_ROLE !== "lane")
+        throw new Error("An ordinary managed lane Host is required");
+      if (!localIdle()) throw new Error("session_busy");
+      const ownership = await owned(true);
+      const { session, ref, id, file } = ownership.identity;
+      if (ownership.unknown || ownership.busy) throw new Error("session_busy");
+      // Use the current native catalogue and configured credential source,
+      // without resolving a key, refreshing discovery, or probing inference.
+      const candidates = session.getAvailableModels().filter(model =>
+        model.provider === command.provider && model.id === command.modelId);
+      const [model] = candidates;
+      if (candidates.length !== 1 || !model || (model.kind !== undefined && model.kind !== "chat")
+        || !session.modelRegistry.hasConfiguredAuth(model))
+        throw new Error("An available exact chat model with configured auth is required");
+      const previousLeaf = session.sessionManager.getLeafId();
+      const before = exact();
+      // No await after the final native guard until the stock setter starts.
+      if (!file || before.ref !== ref || before.session !== session || before.id !== id || before.file !== file
+        || !localIdle()) throw new Error("session_busy");
+      const prior = session.model;
+      const promoting = prior?.provider === model.provider && prior.id === model.id;
+      mutationHeld = true;
+      await session.setModel(model);
+      const after = exact();
+      const actual = session.model;
+      if (after.ref !== ref || after.session !== session || after.id !== id || after.file !== file
+        || actual?.provider !== model.provider || actual.id !== model.id)
+        throw new Error("Lane model selection could not be confirmed");
+      flushLaneModel(session, previousLeaf, promoting);
+      mutationHeld = false;
+      return { provider: actual.provider, id: actual.id };
+    }
+    if (command.type === "set_pr_review_model") {
+      if (!reviewCwd || !localIdle()) throw new ReviewIsolationError("Static PR review model selection requires an idle owned review session");
+      const ownership = await owned(true);
+      const { session, ref } = ownership.identity;
+      const previous = session.model;
+      if (ownership.unknown || ownership.busy || !localIdle() || exact().ref !== ref
+        || !previous || previous.provider !== command.previousProvider || previous.id !== command.previousModelId) {
+        throw new ReviewIsolationError("The previous static PR review model or ownership no longer matches");
+      }
+      reviewPolicy(session, reviewCwd);
+      const model = prReviewModelChoices(session.getAvailableModels()).find(model =>
+        model.provider === command.provider && model.id === command.modelId);
+      if (!model)
+        throw new ReviewIsolationError("Static PR review requires an available exact tool-less inference model");
+      const previousLeaf = session.sessionManager.getLeafId();
+      mutationHeld = true;
+      await session.setModel(model);
+      reviewPolicy(session, reviewCwd);
+      if (exact().ref !== ref || session.model?.provider !== model.provider || session.model?.id !== model.id)
+        throw new ReviewIsolationError("The static PR review model selection could not be confirmed");
+      flushLaneModel(session, previousLeaf, previous.provider === model.provider && previous.id === model.id);
+      mutationHeld = false;
+      return { provider: model.provider, id: model.id };
     }
     if (command.type === "set_model_preset") {
       if (!localIdle()) throw new Error("Native session is busy or has an unresolved mutation");
@@ -743,7 +828,12 @@ export default function hostExtension(pi: ExtensionAPI): void {
         process.stderr.write(`${error instanceof ReviewIsolationError ? error.message : "Static PR review native guard setup failed"}\n`);
         throw error;
       }
-    }
+    } else replyVoice = installReplyVoice(pi, identity.session, async token => {
+      const response = await ownerChannel?.request({ type: "claim_reply_voice", token });
+      return response?.success === true && isDeepStrictEqual(response.data, { claimed: true });
+    }, token => {
+      ownerChannel?.send({ type: "retire_reply_voice", token });
+    });
     await ctx.sessionManager.ensureOnDisk();
     if (exact().ref !== identity.ref) throw new Error("Native session changed during materialization");
     identity.session.sessionManager.flushSync();
@@ -762,7 +852,11 @@ export default function hostExtension(pi: ExtensionAPI): void {
       if (ownerChannel) { socket.destroy(); return; }
       const channel = new HostChannel(socket, socket, true);
       ownerChannel = channel;
-      void channel.exited.then(() => { if (ownerChannel === channel) ownerChannel = undefined; });
+      void channel.exited.then(() => {
+        if (ownerChannel !== channel) return;
+        ownerChannel = undefined;
+        replyVoice?.clear();
+      });
       channel.encoder.setProtocolVersion(2);
       channel.on("frame", (command: Frame) => {
         if (command.type === "response" || typeof command.id !== "string") return;

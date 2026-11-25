@@ -21,6 +21,14 @@ export function isLaneModel(value: unknown): value is LaneModel {
     typeof model.id === "string" && !!model.id.trim() && !model.id.includes("\0");
 }
 
+// Match worker_rpc::model_id: Rust char::is_whitespace / char::is_control.
+const invalidRestrictedSelector = /[\p{White_Space}\p{Cc}]/u;
+
+/** The narrow exact-selector wire used by remote workers and static PR Hosts. */
+export function acceptsRestrictedModelSelector(model: LaneModel): boolean {
+  return !!model.provider && !!model.id && !invalidRestrictedSelector.test(model.provider) && !invalidRestrictedSelector.test(model.id);
+}
+
 /** Project native catalog facts only: endpoints, headers, credentials and opaque internals never leave here. */
 export function codingModels(value: unknown): LaneModelCandidate[] {
   if (!Array.isArray(value)) throw new Error("Native available-model response is missing its model list");

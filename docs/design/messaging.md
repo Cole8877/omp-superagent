@@ -1,6 +1,6 @@
 # Messaging and authority
 
-[Architecture](../../DESIGN.md) · [Execution and coordination](execution.md) · [Operations](../OPERATIONS.md)
+[Architecture](../../DESIGN.md) · [Execution and coordination](execution.md) · [Operations](../OPERATIONS.en.md)
 
 ## Transport and identity
 
@@ -36,6 +36,12 @@ still parses as a command.
 The owner, guild and parent-channel checks still apply. Owner DMs, Discord
 application commands, approval components and restricted group rooms retain
 their existing policies.
+
+Standalone owner preferences, such as the shared reply voice, cannot be set
+through a reply, forward, or attachment. Adapters keep that provenance even
+when a Telegram external reply, Discord forward, or Slack shared attachment
+has no usable in-route snapshot. This marker does not change routing or message
+identity and does not import external reply content.
 
 The Gateway records pending owner-message candidates before advancing the
 Discord WebSocket sequence. Until it verifies the sender and route, it keeps
@@ -221,7 +227,7 @@ input as cancelled. A stalled lane exposes its exact input ID and queue blocker
 through `/status` or `lane_inspect`. Only the operator in the bound topic can use
 `/resolve --lane <input-id>` to cancel that uncertain input. This is not a native
 interrupt, replay or implicit resume, and it preserves other fences and pauses.
-See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for command usage.
+See the [operations guide](../OPERATIONS.en.md#4-commands-and-daily-use) for command usage.
 
 ## Topic routing and controls
 
@@ -328,6 +334,9 @@ See the [operations guide](../OPERATIONS.md#4-명령과-일상-사용) for comma
   answers instead pass through the controller's source-bound outbox without a
   synthesis turn. Approval cards stay with their original native session and
   authorized route.
+- Send an explicit [SOUL reply voice change](execution.md#owner-facing-reply-voice)
+  through `/head` from a bound thread. Ordinary lane requests, reports and
+  quoted text do not become global settings changes.
 - Thread-first work sends a short kickoff to the selected topic. The durable
   `sent` receipt gates new lane dispatch and steering for that input. A missing
   or uncertain delivery is not a successful kickoff.
@@ -379,6 +388,16 @@ is not a native mutation receipt. The head requires the recorded sent receipt
 for the exact card before changing settings. Unselected cards expire after five
 minutes, on Gateway restart, or when a new menu of the same kind replaces them
 on the same route.
+On Discord, the model card shows two selects: the destination (HEAD or the
+lane bound to the opening conversation) and the provider/model browser. With
+both destinations available the operator must pick one; without a bound lane
+only HEAD is offered. Browsing providers or changing the destination is not a
+model change. The card uses the lane's saved model for its checkmark, omitting
+it when uncertain; browsing does not wait for a lane Host. Remote lanes offer
+only identifiers their worker accepts; manual PR review lanes offer only
+static-review-compatible models. Neither restriction filters the HEAD list.
+The final model selection carries the destination with the saved card and
+option indices. A stale lane selection cannot fall back to HEAD.
 The interaction pattern was compared with [Hermes Agent at 242315ce](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/gateway/slash_commands_model.py#L516-L567);
 the catalogue and mutation remain native OMP, and no upstream picker code is used.
 

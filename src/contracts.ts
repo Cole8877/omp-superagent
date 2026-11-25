@@ -42,6 +42,11 @@ export function physicalRouteKey(route: Route): string {
 
 /** Store meta key: owner inputs acknowledged to Gateway whose topic routing is still pending, in delivery order. */
 export const DEFERRED_ROUTING_META = "intake:deferred-routing";
+/** Internal HEAD review ID prefix; authority lives in the current store binding. */
+export const SCOPE_REVIEW_PREFIX = "scope-review:";
+
+/** Exact successor generation reserved when a submitted card is authorized to restore its original lane session. */
+export const laneModelPickerRestoreKey = (sourceId: string) => `lane-model:picker-restore:${sourceId}`;
 
 export interface Attachment {
   id: string;
@@ -118,6 +123,8 @@ export interface Inbound {
     readonly cardId: string;
     readonly group: number;
     readonly option: number;
+    /** Emitted only when the final model choice is made on a scoped Discord card. */
+    readonly target?: "head" | "lane";
     /** Emitted only by the reset picker's separate Confirm action. */
     readonly confirmed?: true;
   };
@@ -129,6 +136,8 @@ export interface Inbound {
   receivedAt: number;
   attachments: Attachment[];
   reply?: ReplyContext;
+  /** The adapter observed a reply or shared message without an in-route reply snapshot. */
+  readonly unresolvedReply?: true;
   discordContext?: DiscordContext;
 }
 
@@ -238,10 +247,33 @@ export type HeadPicker = {
   readonly current?: string;
   readonly groups: readonly { readonly label: string; readonly options: readonly string[] }[];
 } & (
-  | { readonly kind: "model"; readonly currentProvider?: string }
+  | { readonly kind: "model"; readonly currentProvider?: string; readonly modelTargets?: {
+    readonly lane?: {
+      readonly id: string;
+      readonly generation: number;
+      readonly sessionId: string | null;
+      readonly current?: string;
+      readonly currentProvider?: string;
+      /** If present, the canonical option indices allowed in each HEAD group. Empty means no lane choices. */
+      readonly allowedOptions?: readonly (readonly number[])[];
+    };
+  } }
   | { readonly kind: "effort"; readonly forModel: LaneModel }
   | { readonly kind: "usage-reset"; readonly accounts: readonly Pick<OmpResetAccount, "target" | "label" | "identity" | "offer">[] }
 );
+
+/** Both admission and durable lane writes resolve the same original card coordinates. */
+export function resolvePickerOption(picker: HeadPicker, selection: NonNullable<Inbound["pickerSelection"]>) {
+  if (!Number.isSafeInteger(selection.group) || selection.group < 0
+    || !Number.isSafeInteger(selection.option) || selection.option < 0) return null;
+  if (selection.target === "lane") {
+    const lane = picker.kind === "model" ? picker.modelTargets?.lane : undefined;
+    if (!lane || lane.allowedOptions !== undefined && !lane.allowedOptions?.[selection.group]?.includes(selection.option)) return null;
+  }
+  const group = picker.groups[selection.group];
+  const option = group?.options[selection.option];
+  return group && option ? { group, option } : null;
+}
 
 export interface KickoffHold {
   readonly outputId: string;
@@ -263,6 +295,31 @@ export interface OutputRecord {
   state: OutputState;
   remoteId: string | null;
   error: string | null;
+}
+
+export type SettlementOutput = Pick<OutputRecord, "id" | "text" | "picker"> & {
+  /** Controller-only lane failure routing, never derived from output text. */
+  readonly laneFailure?: "quota" | "recover";
+  /** Controller-verified clean native settlement of a solo scope-review admission. */
+  readonly scopeReviewEligible?: boolean;
+};
+
+export interface ScopeReview {
+  readonly lane: Lane;
+  readonly original: InputRecord;
+  readonly handoff: InputRecord;
+}
+
+/** Controller-proven successful native report, with its exact own approval if one was required. */
+export interface ScopeReviewNativeProof {
+  readonly toolCallId: string;
+  readonly approvalId?: string;
+}
+
+export interface LaneRecoveryScope {
+  readonly lane: Lane;
+  readonly failed: InputRecord;
+  readonly original: InputRecord;
 }
 
 export interface Approval {
@@ -327,6 +384,16 @@ export interface StorePort {
   receive(input: Inbound, target: string | null, metadata?: Readonly<Record<string, string>>, workflow?: WorkflowActivation | null): boolean;
   input(id: string): InputRecord | null;
   ownerSource(id: string): InputRecord | null;
+  /** Revalidate a report's exact failed admission, actionable owner and operator selection. */
+  laneRecoveryScope(reportId: string): LaneRecoveryScope | null;
+  /** Stage a verified direct native scope-review signal; does not enqueue a HEAD input. */
+  recordScopeReview(inputId: string, generation: number, sessionId: string, sourceId: string, proof: ScopeReviewNativeProof): boolean;
+  /** Verify the current owner request, solo admission, and lane binding for review or granted dispatch. */
+  scopeReview(reviewId: string): ScopeReview | null;
+  /** Record one HEAD intent; only eligible native settlement can admit corrective work. */
+  requestScopeCorrection(reviewId: string): string;
+  /** Original parent route for a redirected report or a handoff derived from that report. */
+  reportApprovalSource(id: string): InputRecord | null;
   /** Manager handoff's verified reply route, pinned for a parent-origin thread follow-up or a joined bound reply. */
   laneReplyRoute(input: InputRecord, source: InputRecord): Route;
   /** Exact original owner and authorized delivery route for a topic-owned lane input. */
@@ -343,6 +410,8 @@ export interface StorePort {
   latestLaneRun(target: string): InputRecord | null;
   /** A successful lane run still has an unresolved final report or delivery. */
   hasPendingLaneResult(target: string): boolean;
+  /** A current scope review or granted correction still needs this lane generation. */
+  hasPendingScopeReview(target: string): boolean;
   hasPendingLanePlacement(target: string): boolean;
   /** An uncertain HEAD input with a nonempty original native-owner record. */
   hasHeadRecoveryInput(): boolean;
@@ -373,7 +442,7 @@ export interface StorePort {
   progress(id: string, generation: number, sessionId: string, eventId: string, text: string, editInPlace?: boolean): boolean;
   recordLaneReport(id: string, generation: number, sessionId: string, eventId: string, report: LaneReport, observedAt?: number): boolean;
   resolveLaneWaiting(id: string, generation: number, sessionId: string, kind: "tool" | "approval", nativeId: string): boolean;
-  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: Pick<OutputRecord, "id" | "text" | "picker">, headModel?: HeadModelChange, editInPlace?: boolean): boolean;
+  settle(id: string, state: "done" | "uncertain" | "cancelled", output?: SettlementOutput, headModel?: HeadModelChange, editInPlace?: boolean): boolean;
   settleCronControl(inputId: string, update: CronUpdate): boolean;
   resolveLaneInput(controlId: string, laneId: string, inputId: string, output: { readonly id: string; readonly text: string }): boolean;
   headRecoveryEffects(inputId: string): HeadRecoveryEffect[];
@@ -392,10 +461,11 @@ export interface StorePort {
   updateLane(id: string, generation: number, patch: Partial<Pick<Lane,
     "workState" | "runtimeState" | "sessionId" | "pid" | "lastActivityAt" | "result"
   >>): boolean;
-  nextGeneration(id: string): Lane;
+  retireLocalLaneHost(expected: Pick<Lane, "id" | "generation" | "pid" | "sessionId" | "socketPath">): boolean;
+  nextGeneration(id: string, pickerRestoreSourceId?: string): Lane;
   adoptLaneModel(id: string, generation: number, model: LaneModel, reason: string): boolean;
   changeLaneModel(id: string, generation: number, expected: LaneModel | null, model: LaneModel, reason: string,
-    preset: ModelPreset | null, snapshot: LanePresetSnapshot | null, metadata?: Readonly<Record<string, string>>): boolean;
+    preset: ModelPreset | null, snapshot: LanePresetSnapshot | null, metadata?: Readonly<Record<string, string>>, operatorSourceId?: string): boolean;
   recordLaneFallback(id: string, configured: LaneModel, previous: string | null, receipt: LaneFallbackReceipt,
     notice: Pick<OutputRecord, "id" | "sourceId" | "route" | "text">): boolean;
   putApproval(approval: Approval, ownerInputId?: string): void;

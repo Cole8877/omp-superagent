@@ -1461,6 +1461,190 @@ describe("durable coordination store", () => {
     recovered.settle(report.id, "done", { id: "report-answer", text: "HEAD synthesis" });
     expect(recovered.output("report-answer")?.replyTo).toEqual(newThread ? undefined : { route: source.route, messageId: "101" });
     expect(recovered.output("report-answer")?.route).toEqual(newThread ? managed.route : source.route);
+    expect(recovered.getMeta(`lane-recovery-target:${report.id}`)).toBeNull();
+  });
+
+  test("recovery from a topic edit keeps its verified destination and the edited owner receipt", () => {
+    const { store } = fixture();
+    const source = inbound("dm-original", route({ guildId: null, channelId: "owner-dm", threadId: null }));
+    const destination = { ...source.route, topicId: "selected-topic" };
+    store.receive(source, "main", { [`user-source:${source.id}`]: "true" });
+    const handoff = { ...source, id: `handoff:${source.id}:lane`, route: destination };
+    const kickoffId = `${source.id}:kickoff`;
+    store.receive(handoff, null, { [`handoff-source:${handoff.id}`]: source.id, [`kickoff-output:${handoff.id}`]: kickoffId });
+    const selected = store.createLane(lane("selected-lane", destination), handoff.id);
+    store.queueOutput({ id: kickoffId, sourceId: handoff.id, route: destination, text: "Kickoff" });
+    store.claimOutput(kickoffId);
+    store.finishOutput(kickoffId, "sent", "confirmed-kickoff");
+    store.settle(source.id, "done");
+    const edit = { ...source, id: "dm-edit", text: "Updated request" };
+    store.receive(edit, null, { [`user-source:${edit.id}`]: "true", [`topic-owner:${edit.id}`]: selected.id,
+      [`topic-revision:${edit.id}`]: source.id });
+    const revised = { ...edit, id: `handoff:${edit.id}:${selected.id}`, route: destination };
+    store.receive(revised, selected.id, { [`handoff-source:${revised.id}`]: edit.id });
+    store.settle(edit.id, "done");
+    store.submit(revised.id, "revised-native-run", 0);
+
+    store.settle(revised.id, "uncertain", { id: "held-revised-answer", text: "Failure", laneFailure: "recover" });
+
+    const reportId = `report:${revised.id}`;
+    expect(store.outputs()).toEqual([]);
+    expect(store.input(reportId)).toMatchObject({ state: "pending", target: "main", route: destination });
+    expect(store.ownerSource(reportId)?.id).toBe(edit.id);
+    expect(store.getMeta(`lane-recovery-target:${reportId}`)).toBe(selected.id);
+    expect(store.getMeta(`lane-recovery-input:${reportId}`)).toBe(revised.id);
+    expect(store.getMeta(`lane-recovery-state:${reportId}`)).toBe("uncertain");
+    store.settle(reportId, "done", { id: "revised-head-answer", text: "HEAD recovery update" });
+    expect(store.output("revised-head-answer")).toMatchObject({
+      sourceId: reportId, route: destination, replyTo: { route: source.route, messageId: source.messageId },
+    });
+  });
+
+  function recoveryHandoff(store: Store) {
+    const original = inbound("recovery-owner", route({ threadId: null }));
+    store.receive(original, "main", { [`user-source:${original.id}`]: "true" });
+    const selected = lane("recovery-lane");
+    const opening = inbound("recovery-lane-opening", selected.route);
+    store.receive(opening, null);
+    store.createLane(selected, opening.id);
+    const handoff = { ...original, id: `handoff:${original.id}:${selected.id}`, route: selected.route };
+    store.receive(handoff, selected.id, {
+      [`handoff-source:${handoff.id}`]: original.id, [`handoff-reply:${handoff.id}`]: routeKey(selected.route),
+    });
+    store.submit(handoff.id, "native-run", selected.generation);
+    return { original, selected, handoff, reportId: `report:${handoff.id}` };
+  }
+
+  test.each((["pending", "submitted", "done"] as const).flatMap(reportState =>
+    [true, false].map(verifiedOwner => ({ reportState, verifiedOwner }))))(
+    "late quota suppresses undelivered recovery output and produces one pinned notice ($reportState, verified owner: $verifiedOwner)",
+    ({ reportState, verifiedOwner }) => {
+      const { store, path } = fixture();
+      const source = inbound("quota-source", route({ threadId: null }));
+      const destination = route({ threadId: "selected" });
+      store.receive(source, "main", verifiedOwner ? { [`user-source:${source.id}`]: "true" } : {});
+      const handoff = { ...source, id: `handoff:${source.id}:lane`, route: destination };
+      store.receive(handoff, null, { [`handoff-source:${handoff.id}`]: source.id });
+      const selected = store.createLane(lane("quota-lane", destination), handoff.id);
+      store.setMeta(`head-delivery:${source.id}`, JSON.stringify({ source: source.route, destination, laneId: selected.id }));
+      store.submit(handoff.id, "native-run", 0);
+      store.settle(handoff.id, "uncertain", { id: "transport-interrupted", text: "Transport interrupted", laneFailure: "recover" });
+      const reportId = `report:${handoff.id}`;
+      expect(store.laneRecoveryScope(reportId) !== null).toBe(verifiedOwner);
+      if (reportState !== "pending") expect(store.submit(reportId, "head-recovery-run", 0)).toBe(true);
+      const reportAnswer = { id: "stale-head-answer", text: "HEAD recovery update" };
+      if (reportState === "done") store.settle(reportId, "done", reportAnswer);
+
+      expect(store.settle(handoff.id, "uncertain", { id: "quota-notice", text: "Select another model", laneFailure: "quota" })).toBe(true);
+      store.close();
+
+      const reopened = open(path);
+      expect(reopened.input(handoff.id)?.state).toBe("uncertain");
+      expect(reopened.input(reportId)?.state).toBe(reportState === "pending" ? "cancelled" : reportState);
+      if (reportState === "submitted") reopened.settle(reportId, "done", reportAnswer);
+      expect(reopened.output(reportAnswer.id)?.state).toBe(reportState === "done" ? "failed" : undefined);
+      expect(reopened.getMeta(`lane-quota:${handoff.id}`)).toBe("true");
+      expect(reopened.getMeta(`lane-quota-hold:${selected.id}`)).toBe(handoff.id);
+      expect(reopened.outputs()).toMatchObject([{ id: "quota-notice", sourceId: handoff.id, route: destination, text: "Select another model" }]);
+      expect(reopened.output("quota-notice")?.replyTo).toBeUndefined();
+
+      reopened.setMeta(`lane-quota-hold:${selected.id}`, "");
+      const duplicate = { id: "duplicate-quota", text: "Must not be queued", laneFailure: "quota" } as const;
+      expect(reopened.settle(handoff.id, "uncertain", duplicate)).toBe(false);
+      expect(reopened.settle(handoff.id, "cancelled", duplicate)).toBe(true);
+      expect(reopened.getMeta(`lane-quota-hold:${selected.id}`)).toBe("");
+      expect(reopened.outputs().map(output => output.id)).toEqual(["quota-notice"]);
+    },
+  );
+
+  test.each(["recover", undefined] as const)("late completion only supersedes a trusted recovery notice (%s)", laneFailure => {
+    const { store } = fixture();
+    const { handoff, reportId } = recoveryHandoff(store);
+    store.settle(handoff.id, "uncertain", { id: "uncertain-notice", text: "Native result unconfirmed", laneFailure });
+    expect(store.input(reportId)?.state).toBe("pending");
+
+    store.settle(handoff.id, "done");
+
+    expect(store.input(reportId)?.state).toBe(laneFailure === "recover" ? "cancelled" : "pending");
+  });
+
+  test("owner resolution prevents an already submitted recovery report from sending a stale final answer", () => {
+    const { store } = fixture();
+    const { selected, handoff, reportId } = recoveryHandoff(store);
+    store.settle(handoff.id, "uncertain", { id: "uncertain-notice", text: "Native result unconfirmed", laneFailure: "recover" });
+    expect(store.submit(reportId, "head-native-run", 0)).toBe(true);
+    const control = inbound("resolve-lane");
+    store.receive(control, "main");
+
+    expect(store.resolveLaneInput(control.id, selected.id, handoff.id, { id: "resolve-ack", text: "Resolution acknowledged" })).toBe(true);
+    expect(store.input(reportId)?.state).toBe("submitted"); // Do not falsify the active HEAD receipt.
+    store.settle(reportId, "done", { id: "obsolete-head-answer", text: "Failure summary" });
+
+    expect(store.outputs().map(output => output.id)).toEqual(["resolve-ack"]);
+  });
+
+  test.each(["cancelled", "uncertain"] as const)("recovery authority ends when the separate owner source becomes %s", state => {
+    const { store } = fixture();
+    const { original, handoff, reportId } = recoveryHandoff(store);
+    store.settle(handoff.id, "cancelled", { id: "native-failure", text: "No work ran", laneFailure: "recover" });
+    expect(store.laneRecoveryScope(reportId)).toMatchObject({ failed: { id: handoff.id }, original: { id: original.id } });
+    expect(store.submit(reportId, "head-native-run", 0)).toBe(true);
+
+    store.settle(original.id, state);
+
+    expect(store.laneRecoveryScope(reportId)).toBeNull();
+    expect(store.settle(reportId, "done", { id: "obsolete-head-answer", text: "Failure summary" })).toBe(true);
+    expect(store.output("obsolete-head-answer")).toBeNull();
+  });
+
+  test("operator choice supersedes queued recovery authority across A to B to A and restart", () => {
+    const { store, path } = fixture();
+    const { original, selected, handoff, reportId } = recoveryHandoff(store);
+    store.settle(original.id, "done");
+    store.settle(handoff.id, "cancelled", { id: "native-failure", text: "No work ran", laneFailure: "recover" });
+    expect(store.laneRecoveryScope(reportId)?.original.id).toBe(original.id);
+    const model = { provider: "fixture", id: "replacement" };
+    for (const [sourceId, previous, chosen] of [
+      ["choose-b", selected.model, model], ["choose-a", model, selected.model],
+    ] as const) {
+      store.receive(inbound(sourceId, selected.route), "main", { [`user-source:${sourceId}`]: "true" });
+      const requestId = `lane-model-${createHash("sha256").update(sourceId).digest("hex").slice(0, 24)}`;
+      expect(store.submit(sourceId, requestId, 0)).toBe(true);
+      expect(store.changeLaneModel(selected.id, selected.generation, previous, chosen, "Bound operator choice", null, null, {}, sourceId)).toBe(true);
+      store.settle(sourceId, "done");
+    }
+    store.close();
+
+    const reopened = open(path);
+    expect(reopened.lane(selected.id)?.model).toEqual(selected.model);
+    expect(reopened.input(reportId)?.state).toBe("pending");
+    expect(reopened.laneRecoveryScope(reportId)).toBeNull();
+  });
+
+  test("descendant lane correction and report inherit the original parent approval route", () => {
+    const { store, path } = fixture();
+    const { original, selected, handoff, reportId } = recoveryHandoff(store);
+    store.settle(original.id, "done");
+    store.settle(handoff.id, "cancelled", { id: "native-failure", text: "No work ran", laneFailure: "recover" });
+    const report = store.input(reportId);
+    if (!report) throw new Error("Expected the original work-thread report");
+    const correctionId = `handoff:${reportId}:${selected.id}`;
+    store.receive({ ...report, id: correctionId }, selected.id, { [`handoff-source:${correctionId}`]: report.id });
+    store.settle(reportId, "done");
+    store.submit(correctionId, "corrective-native-run", selected.generation);
+    const card = { ...approval("corrective-approval", selected.id, selected.generation), route: original.route };
+    expect(() => store.putApproval({ ...card, route: selected.route }, correctionId)).toThrow("original report source");
+    store.putApproval(card, correctionId);
+    expect(store.resolveApproval(card.id, selected.generation, "answered")).toBe(true);
+    store.settle(correctionId, "done", { id: "corrective-result", text: "Follow-up verified" });
+    store.close();
+
+    const reopened = open(path);
+    const resultId = `report:${correctionId}`;
+    for (const id of [reportId, correctionId, resultId])
+      expect(reopened.reportApprovalSource(id)).toMatchObject({ id: original.id, route: original.route });
+    expect(reopened.approval(card.id)).toMatchObject({ route: original.route, state: "answered" });
+    expect(reopened.input(resultId)?.route).toEqual(selected.route);
   });
 
   test("old SQLite queued outputs migrate without acquiring a new reply identity on replay", () => {

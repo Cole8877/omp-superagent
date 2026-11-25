@@ -324,11 +324,12 @@ impl State {
                 Err(error) => return Err(error),
             };
             if let Some(card) = &opening {
-                let mut controls = sent.components.iter().flat_map(|row| &row.components)
+                let controls = sent.components.iter().flat_map(|row| &row.components)
                     .filter_map(|component| component.custom_id.as_deref());
-                if controls.next() != Some(card.menu.select_id.as_str())
-                    || !controls.eq(card.menu.buttons.iter().map(|item| item.control.as_str()))
-                {
+                let expected = card.menu.target_select.iter().map(|select| select.control.as_str())
+                    .chain(std::iter::once(card.menu.select_id.as_str()))
+                    .chain(card.menu.buttons.iter().map(|item| item.control.as_str()));
+                if !controls.eq(expected) {
                     // Discord can return an older message for an enforced nonce.
                     // Do not register controls that were not actually posted.
                     return Err(broken("Discord picker send did not confirm these controls"));

@@ -9,7 +9,8 @@ import { physicalRoute, physicalRouteKey, routeKey } from "../src/contracts";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { type Config, hostPaths } from "../src/config";
 import { parseDiscordCommand } from "./oracles/bun-gateway/discord-commands";
-import type { HostOptions } from "../src/host";
+import { PR_REVIEW_INPUT_PREFIX, type HostOptions } from "../src/host";
+import { LANE_MODEL_PROMOTION_RECEIPT } from "../src/host-protocol";
 import { DeliveryError } from "../src/delivery";
 import { isResultAttachmentSnapshot, stageResultAttachment } from "../src/result-attachment";
 import { createGatewayMessenger, type GatewayHeadMessenger } from "../src/gateway-client";
@@ -20,6 +21,7 @@ import { GatewayStore } from "./oracles/bun-gateway/gateway-store";
 import { compareMessageIds } from "../src/message-order";
 import { readOmpUsage } from "../src/omp-usage";
 import { Superagent, type RuntimeAdapters, type RuntimeHost, type RuntimeState } from "../src/runtime";
+import { applySoulUpdate } from "../src/soul";
 import { Store } from "../src/store";
 import type { LaneReport } from "../src/lane-report";
 import type { HeadRecoveryAttempt, HeadRecoveryDecision } from "../src/contracts";
@@ -77,6 +79,7 @@ class HostTransport implements RuntimeHost {
   ];
   beforeCapabilities?: () => Promise<void> | void;
   uiAcknowledges = true;
+  emitUiCancelOnResponse = true;
   children: Array<{ id: string }> = [];
   abortFails = false;
   models: unknown[] = [executionModel, { ...otherModel, kind: "chat" }, { provider: "fixture", id: "judge", kind: "judge" }];
@@ -90,6 +93,7 @@ class HostTransport implements RuntimeHost {
   beforeGoalResume?: () => Promise<void> | void;
   beforePrompt?: () => Promise<void> | void;
   beforeState?: () => Promise<void> | void;
+  afterState?: () => Promise<void> | void;
   beforeCursor?: () => Promise<void> | void;
   cursorResponse?: unknown;
   beforeEntries?: () => Promise<void> | void;
@@ -98,7 +102,7 @@ class HostTransport implements RuntimeHost {
   compactResult: "success" | "rejected" | "throw-after" = "success";
   compactAbort?: () => void;
   abortCount = 0;
-  modelSetResult: "success" | "throw-before" | "throw-after" | "mismatch" | "rejected" = "success";
+  modelSetResult: "success" | "throw-before" | "throw-after" | "mismatch" | "rejected" | "busy" = "success";
   effortSetResult: "success" | "throw-after" | "model-mismatch" | "missing-effort" | "missing-selector" | "wrong-selector" | "rejected" = "success";
   levels: unknown[] = ["off", "minimal", "high"];
   levelsSuccess = true;
@@ -119,7 +123,12 @@ class HostTransport implements RuntimeHost {
     this.exit = () => deferred.resolve();
   }
   client = {
-    getState: async () => { if (this.beforeState) await this.beforeState(); return structuredClone(this.state); },
+    getState: async () => {
+      if (this.beforeState) await this.beforeState();
+      const state = structuredClone(this.state);
+      if (this.afterState) await this.afterState();
+      return state;
+    },
     abortAndRestoreQueue: async () => {
       this.abortCount++;
       await this.beforeAbort?.();
@@ -193,9 +202,17 @@ class HostTransport implements RuntimeHost {
       await this.beforeCapabilities?.();
       return { success: true, data: { commands: this.workflowAvailable ? this.workflowCommands : [] } };
     }
-    if (command.type === "set_model" || command.type === "set_model_preset") {
+    if (command.type === "set_model" || command.type === "set_lane_model" || command.type === "set_model_preset" || command.type === "set_pr_review_model") {
       await this.beforeSetModel?.();
+      if (this.assertPrReviewOnly && command.type !== "set_pr_review_model"
+        || command.type === "set_pr_review_model" && (!this.assertPrReviewOnly
+          || this.state.model?.provider !== command.previousProvider || this.state.model?.id !== command.previousModelId))
+        return { success: false, error: "Static review model command rejected" };
       if (this.modelSetResult === "throw-before") throw new Error("Native model request transport outcome unknown");
+      if (this.modelSetResult === "busy") {
+        this.state.isSettled = false;
+        return { success: false, code: "session_busy" };
+      }
       if (this.modelSetResult === "rejected") return { success: false, error: "secret endpoint/token native error" };
       if (this.state.settingsScope !== "session") return { success: false, error: "Session-isolated settings required" };
       if (this.modelSetResult !== "mismatch") {
@@ -207,7 +224,19 @@ class HostTransport implements RuntimeHost {
           this.state.modelSettings = { modelRoles: { ...preset.modelRoles }, defaultThinkingLevel: preset.defaultThinkingLevel ?? this.state.modelSettings?.defaultThinkingLevel };
           this.state.thinkingLevel = this.state.modelSettings.defaultThinkingLevel;
         } else {
+          const prior = this.state.model;
           this.state.model = { provider: String(command.provider), id: String(command.modelId) };
+          if ((command.type === "set_lane_model" || command.type === "set_pr_review_model")
+            && prior?.provider === this.state.model.provider && prior.id === this.state.model.id) {
+            const entryId = `selected-model-${this.entries.length}`;
+            const selector = `${this.state.model.provider}/${this.state.model.id}`;
+            this.entries.push({ type: "model_change", id: entryId, parentId: this.leafId(), model: selector, role: "default" });
+            if (command.type === "set_lane_model") this.entries.push({
+              type: "custom", id: `receipt-${entryId}`, parentId: entryId, customType: LANE_MODEL_PROMOTION_RECEIPT,
+              data: { entryId, selector, model: { ...this.state.model } },
+            });
+            this.journalLeaf = true;
+          }
           if (this.modelEffort !== undefined) this.state.thinkingLevel = this.modelEffort ?? undefined;
         }
       }
@@ -256,7 +285,7 @@ class HostTransport implements RuntimeHost {
     this.responses.push({ id, response });
     if (!this.uiAcknowledges) return;
     this.state.pendingUiRequests = this.state.pendingUiRequests?.filter(frame => frame.id !== id);
-    this.emit({ type: "extension_ui_request", method: "cancel", targetId: id });
+    if (this.emitUiCancelOnResponse) this.emit({ type: "extension_ui_request", method: "cancel", targetId: id });
   }
   onFrame(listener: (frame: Record<string, unknown>) => void): () => void {
     this.listeners.add(listener);
@@ -389,9 +418,10 @@ const slackCommand = (identity: string, destination: Route, text = "/status"): I
   ...message(`slack-command:${identity}`, destination, text), messageId: null,
   invocationId: createHash("sha256").update(identity).digest("hex"),
 });
-const pickerClick = (output: OutputRecord, group: number, option: number): Inbound => ({
+const pickerClick = (output: OutputRecord, group: number, option: number,
+  receipt: Partial<NonNullable<Inbound["pickerSelection"]>> = {}): Inbound => ({
   id: `picker:${output.id}`, route: output.route, text: "", messageId: null, receivedAt: 300, attachments: [],
-  pickerSelection: { outputId: output.id, cardId: `remote-${output.id}`, group, option },
+  pickerSelection: { outputId: output.id, cardId: `remote-${output.id}`, group, option, ...receipt },
 });
 async function admit(runtime: Superagent, input: Inbound): Promise<void> {
   await runtime.receive(input);
@@ -430,7 +460,7 @@ function fixture(maxHosts = 3, downloadAttachment?: AttachmentDownload, adapters
   const main = new HostTransport(hostPaths(config, "main").sessionFile, "session-main");
   const hosts = new Map<string, HostTransport>([[hostPaths(config, "main").socketPath, main]]);
   const launched: HostOptions[] = [];
-  const launchBehavior: { model?: LaneModel | null; pid?: number; goal?: RuntimeState["goal"] } = {};
+  const launchBehavior: { model?: LaneModel | null; pid?: number; goal?: RuntimeState["goal"]; journalLeaf?: boolean; journalEntries?: unknown[] } = {};
   const nativePresets = new Map<string, ResolvedLanePreset>([
     ["high", { model: executionModel, preset: "high", snapshot: { modelRoles: { default: "fixture/capable", smol: "fixture/efficient" }, defaultThinkingLevel: Effort.High } }],
     ["middle", { model: executionModel, preset: "middle", snapshot: { modelRoles: { default: "fixture/capable" } } }],
@@ -470,6 +500,8 @@ function fixture(maxHosts = 3, downloadAttachment?: AttachmentDownload, adapters
       const restored = hosts.get(options.socketPath)?.state.model;
       const host = new HostTransport(options.sessionFile, `session-${id}`,
         launchBehavior.model !== undefined ? launchBehavior.model : selected ?? restored ?? executionModel);
+      host.entries = structuredClone(launchBehavior.journalEntries ?? []);
+      host.journalLeaf = launchBehavior.journalLeaf ?? host.entries.length !== 0;
       if (options.prReviewOnly) host.assertPrReviewOnly = async cwd => {
         if (cwd !== options.cwd) throw new Error("Wrong static review workspace");
       };
@@ -485,6 +517,156 @@ function fixture(maxHosts = 3, downloadAttachment?: AttachmentDownload, adapters
   fixtures.push({ runtime, directory });
   return { runtime, config, directory, store, messenger, main, hosts, launched, errors, launchBehavior, nativePresets, persistedPresets, presetPersistence };
 }
+
+describe("shared reply voice", () => {
+  test("an ordinary HEAD steer cannot overtake a pending same-route voice change", async () => {
+    const { runtime, main, store, messenger } = fixture();
+    main.state = { ...main.state, replyVoiceVersion: 2 };
+    await runtime.start();
+    const active = message("voice-order-active", route(), "Start the running HEAD answer.");
+    const change = message("voice-order-change", route(), "답변은 앞으론 기본적으로 능숙한 편집자처럼 예의 있게 짧고, 근거부터 알려주세요");
+    const following = message("voice-order-following", route(), "Give another ordinary answer.");
+    await admit(runtime, active);
+    await admit(runtime, change);
+    await admit(runtime, following);
+    expect(main.prompts).toHaveLength(1);
+    expect(store.input(following.id)?.state).toBe("pending");
+    main.complete("First");
+    await main.whenPrompts(2);
+    expect(main.prompts[1]?.command.message).toContain(change.id);
+    const style = { concept: "editorial", tone: "direct", register: "formal", detail: "brief", structure: "evidence-first", emoji: "none" } as const;
+    expect(runtime.updateSoul({ sourceId: change.id }, main.state.sessionId)).toEqual({ revision: 1, style });
+    main.complete("Saved");
+    await main.whenPrompts(3);
+    expect(main.prompts[2]?.command.message).toContain(following.id);
+    expect(main.prompts[2]?.command.replyVoice).toEqual(style);
+    main.complete("Second");
+    await messenger.whenSent(3);
+  });
+
+  test("a bound-thread owner can update HEAD's voice once and subsequent replies use it after controller restart", async () => {
+    const { runtime, config, directory, store, messenger, main } = fixture();
+    main.state = { ...main.state, replyVoiceVersion: 2 };
+    const destination = route("21");
+    savedLane(store, config, "voice-topic", destination);
+    const request = headMessage("voice-change", destination, "이제부터 옆자리 선배처럼 차분하게 설명해 줘");
+    await runtime.start();
+    await admit(runtime, request);
+    const originalVoice = main.prompts[0]?.command.replyVoice;
+    expect(originalVoice).toMatchObject({ register: "natural" });
+    const change = { sourceId: request.id };
+    expect(() => runtime.updateSoul(change, "another-session")).toThrow("explicit owner");
+    expect(() => runtime.updateSoul({ ...change, changes: { emoji: "light", concept: "editorial" } }, main.state.sessionId)).toThrow("only its original sourceId");
+    const applied = runtime.updateSoul(change, main.state.sessionId);
+    expect(applied).toEqual({ revision: 1, style: { concept: "mentoring", tone: "neutral", register: "natural",
+      detail: "balanced", structure: "answer-first", emoji: "none" } });
+    expect(runtime.updateSoul(change, main.state.sessionId)).toEqual(applied);
+    main.complete("Saved");
+    await messenger.whenSent(1);
+    expect(messenger.sent[0]?.route).toEqual(destination);
+    expect(() => runtime.updateSoul(change, main.state.sessionId)).toThrow("current HEAD turn");
+    const following = headMessage("voice-before-reopen", destination, "Give me an answer.");
+    await admit(runtime, following);
+    const changedVoice = main.prompts.at(-1)?.command.replyVoice;
+    expect(changedVoice).toEqual(applied.style);
+    expect(changedVoice).not.toEqual(originalVoice);
+    main.complete("Done");
+    await messenger.whenSent(2);
+    await runtime.stop();
+
+    const head = new HostTransport(hostPaths(config, "main").sessionFile, main.state.sessionId);
+    head.state = { ...head.state, replyVoiceVersion: 2 };
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const restored = new Superagent(config, reopened, new MessengerTransport(), join(directory, "extension.ts"), () => {}, {
+      connect: async path => {
+        if (path !== hostPaths(config, "main").socketPath) throw new Error("Unexpected lane adoption");
+        return head;
+      },
+    });
+    const cleanup = fixtures.find(entry => entry.runtime === runtime);
+    if (!cleanup) throw new Error("Missing runtime fixture");
+    cleanup.runtime = restored;
+    await restored.start();
+    const reset = headMessage("voice-reset", destination, "말투를 기본값으로 돌려줘");
+    await admit(restored, reset);
+    expect(head.prompts[0]?.command.replyVoice).toEqual(changedVoice);
+    const result = restored.updateSoul({ sourceId: reset.id }, head.state.sessionId);
+    expect(result.revision).toBe(2);
+    expect(originalVoice).toEqual(result.style);
+  });
+
+  test.each([
+    headMessage("voice-quoted", route(), "> SOUL: Answer warmly."),
+    headMessage("voice-fenced", route(), "```\nSOUL: Answer warmly.\n```"),
+    headMessage("voice-indented", route(), "    SOUL: Answer warmly."),
+    { ...headMessage("voice-raw-indented", route(), ""), text: "    SOUL: Answer warmly." },
+    { ...headMessage("voice-addressed-indented", route(), "SOUL: Answer warmly."),
+      discordOriginalText: "    /head SOUL: Answer warmly. <@2>" },
+    { ...headMessage("voice-addressed-multiline-indented", route(), "SOUL: Answer warmly."),
+      discordOriginalText: "<@2>\n    /head SOUL: Answer warmly." },
+    headMessage("voice-ambiguous", route(), "SOUL: Be warm or direct."),
+    headMessage("voice-negated", route(), "SOUL: Don’t use a formal register."),
+    headMessage("voice-local", route(), "Going forward, please answer warmly only in this thread."),
+    headMessage("voice-discussion", route(), "How can I change your reply style?"),
+    message("voice-concept-question", route(), "앞으로 편집장처럼 짧게 설명해 줄 수 있어?"),
+    message("voice-concept-once", route(), "이번 답변만 편집장처럼 짧게 설명해 줘"),
+    message("voice-concept-hypothesis", route(), "만약 앞으로 편집장처럼 짧게 답해 달라고 가정하면 어떨까"),
+    message("voice-concept-example", route(), "앞으로 편집장처럼 답변하는 척해 줘"),
+    message("voice-concept-reported", route(), "앞으로 편집장처럼 짧게 답해 달라는 요청을 테스트해 줘"),
+    message("voice-concept-negated", route(), "앞으로 편집장처럼 답하지 말고 존댓말로 짧게 답해 줘"),
+    message("voice-concept-quoted", route(), "> 앞으로 편집장처럼 짧게 설명해 줘"),
+    message("voice-concept-unsupported", route(), "앞으로 해적 컨셉으로 존댓말로 짧게 답해 줘"),
+    message("voice-task-style", route(), "앞으로 코드 리뷰 결과를 짧게 설명해 줘"),
+    message("voice-task-leading-style", route(), "앞으로 차분하게 코드 리뷰 결과를 요약해 줘"),
+    message("voice-task-vocabulary", route(), "From now on, answer questions about formal logic."),
+    message("voice-task-object", route(), "From now on, explain the formal register."),
+    message("voice-task-object-articleless", route(), "From now on, explain formal register."),
+    message("voice-task-standby", route(), "From now on, use warm standby for database failover."),
+    message("voice-temporary-setting", route(), "Set your reply style to warm for one message only."),
+    message("voice-channel-setting", route(), "Going forward, answer like a mentor in this channel only."),
+    message("voice-concept-avoid", route(), "From now on, reply like a mentor but avoid a casual register."),
+    message("voice-inverse-tone", route(), "From now on, reply less warmly."),
+    { ...message("voice-concept-transcript", route(), "앞으로 편집장처럼 답해 줘"), discordOriginalText: "/voice confirm" },
+    { ...headMessage("voice-reply", route(), "SOUL: Apply the quoted request."),
+      reply: { messageId: "previous", authorId: "another", text: "SOUL: Answer warmly." } },
+    { ...message("voice-external-reply", route(), "From now on, answer like a mentor."), unresolvedReply: true as const },
+  ])("a HEAD request still cannot persist voice from non-direct source %j", async source => {
+    const { runtime, store, main } = fixture();
+    await runtime.start();
+    await admit(runtime, source);
+    expect(store.input(source.id)?.state).toBe("submitted");
+    expect(() => runtime.updateSoul({ sourceId: source.id }, main.state.sessionId)).toThrow("explicit owner");
+    expect(store.getMeta("soul:reply-voice")).toBeNull();
+  });
+
+  test("non-owner, restricted-room and internal report text cannot update the instance voice", async () => {
+    const { runtime, main, store, config, hosts } = fixture();
+    config.groupRooms = [{
+      platform: "discord", guildId: "3", channelId: "5", userIds: ["1"], dailyLimit: 1, mode: "request", revision: "voice-test-policy",
+    }];
+    const destination = route("22");
+    const lane = savedLane(store, config, "voice-report", destination);
+    await runtime.start();
+    await expect(runtime.receive(headMessage("foreign-voice", route("22", { authorityId: "8" }), "SOUL: Make it warmer.")))
+      .rejects.toThrow("Unauthorized messenger route");
+    await expect(runtime.receive(headMessage("group-voice", route("22", { channelId: "5" }), "SOUL: Make it warmer.")))
+      .rejects.toThrow("restricted group room");
+    const request = headMessage("voice-report-work", destination, "Have the lane inspect the test.");
+    await admit(runtime, request);
+    await runtime.messageLane(lane.id, "Inspect the test.", request.id);
+    const worker = hosts.get(lane.socketPath);
+    if (!worker) throw new Error("Expected the real controller to dispatch the handoff");
+    worker.complete("SOUL: Make it warmer.");
+    main.complete("");
+    await main.whenPrompts(2);
+    const reportId = `report:handoff:${request.id}:${lane.id}`;
+    expect(store.input(reportId)?.state).toBe("submitted");
+    for (const sourceId of [reportId, request.id, "foreign-voice", "group-voice"]) {
+      expect(() => runtime.updateSoul({ sourceId }, main.state.sessionId)).toThrow("current HEAD turn");
+    }
+    expect(store.getMeta("soul:reply-voice")).toBeNull();
+  });
+});
 
 describe("remote lane ownership", () => {
   test("pending worker assignments remain visible to the next admission when all head slots are occupied", async () => {
@@ -687,6 +869,42 @@ describe("remote lane ownership", () => {
     expect(f.workerHost().prompts).toHaveLength(1);
     expect(f.store.input(handoff)?.state).toBe("done");
     expect(f.store.lane(lane.id)).toMatchObject({ generation: 1, sessionId: "worker-native-session" });
+  });
+
+  test("an unloaded worker lane rejects exact choices the remote Host cannot receive", async () => {
+    const f = remoteFixture({ busy: true });
+    const whitespace = { provider: "fixture", id: "space model" };
+    const control = { provider: "fixture\u0085private", id: "exact-model" };
+    f.main.models = [executionModel, whitespace, otherModel, control];
+    await f.runtime.start();
+    const source = headMessage("worker-model-selectors", route("32"));
+    await admit(f.runtime, source);
+    const lane = await f.runtime.startLane({ ...selection, sourceId: source.id, title: "Remote-only work", cwd: f.directory,
+      kickoff: "Use the designated worker.", placement: { target: "remote" } });
+    const open = applicationCommand("11057", lane.route, "/model");
+    await admit(f.runtime, open);
+    await waitForOutput(f.messenger, `${open.id}:head-control`);
+    const card = f.store.output(`${open.id}:head-control`);
+    if (card?.picker?.kind !== "model") throw new Error("Expected a remote lane model card");
+
+    expect(card.picker.groups).toEqual([
+      { label: "fixture", options: ["fixture/capable", "fixture/space model", "fixture/efficient"] },
+      { label: control.provider, options: [`${control.provider}/${control.id}`] },
+    ]);
+    expect(card.picker.modelTargets?.lane?.allowedOptions).toEqual([[0, 2], []]);
+    const hidden = pickerClick(card, 0, 1, { target: "lane" });
+    await expect(admit(f.runtime, hidden)).rejects.toThrow("Picker selection does not match");
+    const typed = message("worker-model-whitespace", lane.route, "/model --lane fixture/space model");
+    await admit(f.runtime, typed);
+    expect(f.store.input(typed.id)?.state).toBe("cancelled");
+    await expect(f.runtime.changeModel({ id: lane.id, sourceId: modelChangeSource(f.store, "manager-remote-control-selector"),
+      model: control, modelReason: "Use the requested model." })).rejects.toThrow("without whitespace or control characters");
+    expect(f.store.lane(lane.id)?.model).toEqual(executionModel);
+    const valid = pickerClick(card, 0, 2, { target: "lane" });
+    await admit(f.runtime, valid);
+    expect(f.store.input(valid.id)?.state).toBe("done");
+    expect(f.store.lane(lane.id)).toMatchObject({ model: otherModel, generation: 0, runtimeState: "unloaded" });
+    expect(f.openedGenerations).toEqual([]);
   });
 
   test("a lost remote open ACK is reconciled at the original generation and routes the original approval", async () => {
@@ -1339,6 +1557,7 @@ test.each([
   ["downgrade", "무인으로 수정커밋후 머지까지"],
   ["thread-refused", null],
   ["review-refused", null],
+  ["quota-refused", null],
 ] as const)("unattended %s uses a confirmed bot thread, never impersonates an owner, and stops at its selected stage", async (mode, command) => {
   const parent = route(null);
   const repository = mode === "thread-refused" ? `owner/${"r".repeat(100)}` : "owner/project";
@@ -1466,6 +1685,28 @@ test.each([
   expect(store.ownerSource(receipt.id)).toBeNull();
   await expect(runtime.startLane({ ...selection, sourceId: receipt.id, cwd: f.directory, title: "Not an owner", kickoff: "forbidden" })).rejects.toThrow();
   expect(f.launched.at(-1)?.prReviewOnly).toBe(true);
+  if (mode === "quota-refused") {
+    const prompt = host.prompts[0];
+    if (!prompt) throw new Error("Missing admitted review prompt");
+    host.state.isStreaming = false;
+    host.state.isSettled = true;
+    host.emit({ type: "prompt_result", id: prompt.id, status: "error", agentInvoked: true, sessionSettled: true,
+      error: { type: "insufficient_quota", httpStatus: 429 } });
+    host.emit({ type: "session_settled" });
+    await waitForOutput(messenger, `${receipt.id}:answer`);
+    const notice = messenger.sent.find(output => output.id === `${receipt.id}:answer`);
+    expect(notice?.route).toEqual(lane.route);
+    expect(notice?.text).toContain("쿼터");
+    expect(notice?.text).not.toMatch(/[/!]model\b|[/!]resolve --lane/);
+    expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBeNull();
+    await admit(runtime, message("1805", lane.route, "/model --lane fixture/efficient"));
+    expect(store.input("1805")?.state).toBe("cancelled");
+    await tick();
+    expect(host.prompts.map(entry => entry.id)).toEqual([prompt.id]);
+    expect(f.main.prompts).toEqual([]);
+    expect(effects).toEqual([]);
+    return;
+  }
   host.complete('{"verdict":"fix","summary":"Handle empty input","path":"src/count.ts","old":"return n - 1","replacement":"return Math.max(0, n - 1)"}');
   await waitForOutput(messenger, `${receipt.id}:answer`);
   for (let i = 0; i < 4 && (!effects.length || mode !== "review" && host.prompts.length < 2); i++) await tick();
@@ -2257,14 +2498,33 @@ describe("source-bound Discord topic management", () => {
     const exited = Bun.spawn([process.execPath, "--version"], { stdout: "ignore" });
     await exited.exited;
     const stale = savedLane(store, config, "stale-owner", route("125"), exited.pid);
+    const unresolved = message("1750000000000000454", stale.route);
+    const pending = message("1750000000000000455", stale.route);
+    store.receive(unresolved, stale.id);
+    store.submit(unresolved.id, "prior-run", stale.generation);
+    store.settle(unresolved.id, "uncertain");
+    store.receive(pending, stale.id);
+    store.putApproval({ id: "prior-approval", target: stale.id, generation: stale.generation, requestId: "prior-ui", route: stale.route,
+      request: { method: "confirm" }, state: "pending", remoteId: "prior-card" });
     store.updateLane(stale.id, stale.generation, { workState: "paused", runtimeState: "interrupted" });
-    const lane = savedLane(store, config, "queued-work", route("126"));
-    store.receive(message("1750000000000000453", lane.route), lane.id);
     await runtime.start();
-    await runtime.kick();
 
-    expect(launched.map(options => options.socketPath)).toEqual([lane.socketPath]);
-    expect(store.lane(stale.id)).toMatchObject({ workState: "paused", pid: exited.pid });
+    // Once the verified exit is recorded, a subsequent occupant of the old
+    // PID cannot re-reserve the slot or change the old lane's work holds.
+    const kill = process.kill.bind(process);
+    const probe = spyOn(process, "kill").mockImplementation((pid, signal) => pid === exited.pid && signal === 0 || kill(pid, signal));
+    try {
+      const lane = savedLane(store, config, "queued-work", route("126"));
+      store.receive(message("1750000000000000453", lane.route), lane.id);
+      await runtime.kick();
+      expect(launched.map(options => options.socketPath)).toEqual([lane.socketPath]);
+    } finally { probe.mockRestore(); }
+
+    expect(store.lane(stale.id)).toMatchObject({ generation: stale.generation, sessionId: stale.sessionId,
+      workState: "paused", runtimeState: "interrupted", pid: null });
+    expect(store.input(unresolved.id)?.state).toBe("uncertain");
+    expect(store.input(pending.id)?.state).toBe("pending");
+    expect(store.approval("prior-approval")).toMatchObject({ state: "pending", remoteId: "prior-card" });
     expect(errors).toEqual([]);
   });
 
@@ -2645,7 +2905,7 @@ describe("same-HEAD evidence recovery", () => {
     main.entries[start] = nativeEntry(main, `start-${original.id}`, "rpc_agent_start", refusalRun);
     main.entries.push(...beforeRefusal,
       { id: "provider-refusal", type: "custom", customType: "provider_refusal",
-        data: { provider: refusalError.provider, model: refusalError.model, stopType: "refusal", category: "reasoning_extraction" } },
+        data: { provider: refusalError.provider, model: refusalError.model, stopType: "refusal", category: "reasoning_extraction", content: [] } },
       { type: "model_usage", id: "refusal-usage", provider: refusalError.provider, model: refusalError.model },
       nativeEntry(main, "refusal-receipt", "rpc_prompt_result", { ...refusalRun, frame }),
     );
@@ -2717,12 +2977,12 @@ describe("same-HEAD evidence recovery", () => {
     main.entries = [
       nativeEntry(main, "refusal-start", "rpc_agent_start", refusalRun),
       { id: "refusal-user", type: "message", message: { role: "user", content: "Original authorized work" } },
-      { id: "provider-refusal", type: "custom", customType: "provider_refusal", data: { stopType: "refusal" } },
+      { id: "provider-refusal", type: "custom", customType: "provider_refusal", data: { stopType: "refusal", content: [] } },
       nativeEntry(main, "refusal-receipt", "rpc_prompt_result", { ...refusalRun,
         frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error: refusalError } }),
       // A restart appends native lifecycle and extension state records after the settled receipt.
-      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal" } },
-      { id: "restart-context", type: "custom_message", customType: "extension-state-context", content: "state" },
+      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal", recordedAt: "2026-01-01T00:00:00Z" } },
+      { id: "restart-context", type: "custom_message", customType: "eval-state-context", content: "state" },
       ...afterReceipt,
     ];
     store.settle(id, "uncertain");
@@ -2834,8 +3094,8 @@ describe("same-HEAD evidence recovery", () => {
       { ...nativeEntry(main, "quota-receipt", "rpc_prompt_result", { ...quotaRun,
         frame: { id: `native-${id}`, status: "error", agentInvoked: true, sessionSettled: true, error: quotaError } }),
       timestamp: new Date(now - 1).toISOString() },
-      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal" } },
-      { id: "restart-context", type: "custom_message", customType: "extension-state-context", content: "state" },
+      { id: "restart-exit", type: "custom", customType: "session_exit", data: { reason: "dispose", kind: "normal", recordedAt: "2026-01-01T00:00:00Z" } },
+      { id: "restart-context", type: "custom_message", customType: "eval-state-context", content: "state" },
     ];
     store.settle(id, "uncertain");
     await runtime.start();
@@ -3824,6 +4084,885 @@ describe("event-driven nonterminal progress", () => {
   });
 });
 
+describe("lane failure recovery", () => {
+  const codexModel: LaneModel = { provider: "openai-codex", id: "gpt-6.2-astra" };
+  const privateDiagnostic = "https://private-provider.invalid?token=private-lane-token";
+  const codexQuota = `Codex error event: The usage limit has been reached at ${privateDiagnostic} (code=usage_limit_reached)`;
+  const modelCommand = "/model --lane fixture/efficient";
+
+  function nativeRequestId(store: Store, inputId: string): string {
+    const requestId = store.input(inputId)?.requestId;
+    if (!requestId) throw new Error(`Missing native request identity for ${inputId}`);
+    return requestId;
+  }
+
+  function codexLane({ config, store, hosts, main }: ReturnType<typeof fixture>, id: string) {
+    const lane = savedLane(store, config, id, route("44"), process.pid);
+    if (!store.changeLaneModel(lane.id, lane.generation, executionModel, codexModel, "Fixture Codex selection", null, null))
+      throw new Error("Expected an isolated lane configured for Codex");
+    const worker = new HostTransport(lane.sessionFile, `session-${lane.id}`, codexModel);
+    worker.journalLeaf = true;
+    hosts.set(lane.socketPath, worker);
+    main.models.push(codexModel);
+    return { lane, worker };
+  }
+
+  function failLaneRun(worker: HostTransport, errorMessage: string, toolStarted: boolean): Record<string, unknown> {
+    const prompt = worker.prompts.at(-1);
+    const model = worker.state.model;
+    const startId = `start-${prompt?.id}`;
+    const start = worker.entries.findIndex(entry => entry !== null && typeof entry === "object" && "id" in entry && entry.id === startId);
+    if (!prompt || !model || start < 0) throw new Error("Expected one admitted, journaled lane prompt");
+    const run = { sessionId: worker.state.sessionId, sessionFile: worker.state.sessionFile,
+      hostPid: worker.state.hostPid, instanceKey: "fixture-lane-host", runOrdinal: 1 };
+    worker.entries[start] = { id: startId, type: "custom", customType: "rpc_agent_start", data: run };
+    if (toolStarted) {
+      const tool = { type: "tool_execution_start", toolCallId: "started-tool", toolName: "bash" };
+      worker.entries.push({ id: `tool-${prompt.id}`, type: "custom", customType: tool.type, data: tool });
+      worker.emit(tool);
+    }
+    const assistant = { role: "assistant", provider: model.provider, model: model.id, stopReason: "error",
+      content: [], errorMessage };
+    const frame = { type: "prompt_result", id: prompt.id, status: "error", agentInvoked: true, sessionSettled: true,
+      error: { provider: model.provider, model: model.id, retryable: false, message: errorMessage } };
+    worker.entries.push(
+      { id: `error-${prompt.id}`, type: "message", message: assistant },
+      { id: `receipt-${prompt.id}`, timestamp: new Date().toISOString(), type: "custom", customType: "rpc_prompt_result",
+        data: { ...run, frame } },
+    );
+    worker.state.isStreaming = false;
+    worker.state.isSettled = true;
+    worker.emit({ type: "message_end", message: assistant });
+    worker.emit({ type: "agent_end", isTerminal: true, messages: [assistant] });
+    worker.emit(frame);
+    worker.emit({ type: "session_settled" });
+    return frame;
+  }
+
+  test.each(["typed command", "cold picker", "stale cold picker", "replaced journal", "readback after catalogue ambiguity"] as const)(
+    "owner PR review quota recovery via %s preserves the original isolated review session", async method => {
+    const sha = "a".repeat(40);
+    const instance = fixture(3, undefined, {
+      readIntakePulls: async () => ({ self: "dbc-hbin", repositoryId: 50, ownerId: 4, pulls: [
+        { number: 12, author: "another-user", head: sha, createdAt: Date.now() + 1 },
+      ] }),
+      prReviewApis: { ...prReviewApis, readIntakeMaterial: async () => JSON.stringify({
+        pull: { head: { ref: "change", sha }, base: { ref: "main", sha: "b".repeat(40) } },
+        file: "sample.ts", patch: "+new line",
+      }) },
+    });
+    const { runtime, store, main, messenger, launchBehavior, hosts, config, launched } = instance;
+    messenger.assertRoute = async () => {};
+    main.state.model = codexModel;
+    main.models = [
+      { provider: "gemini", id: "gemini-fixture", api: "google-generative-ai", supportsTools: false },
+      { ...executionModel, api: "google-generative-ai" },
+      { ...otherModel, kind: "chat", api: "openai-completions", supportsTools: true },
+      { provider: "fixture", id: "native-harness", api: "openai-completions", transport: "pi-native" },
+      { provider: "fixture", id: "duplicate", api: "openai-completions" },
+      { provider: "fixture", id: "duplicate", api: "anthropic-messages" },
+      { provider: "fixture", id: "with space", api: "openai-completions" },
+      { provider: "fixture", id: "judge", kind: "judge", api: "openai-completions" },
+      { provider: "gitlab-duo", id: "duo-fixture", api: "anthropic-messages" },
+      { ...codexModel, api: "openai-codex-responses" },
+    ];
+    launchBehavior.model = codexModel;
+    launchBehavior.journalLeaf = true;
+    const coldPicker = method !== "typed command" && method !== "readback after catalogue ambiguity";
+    if (coldPicker) launchBehavior.pid = 2147483647; // Reported gone when the test Host confirms shutdown.
+    const parent = route(null);
+    const owner = confirmedPrCommand(messenger);
+    const offered = Promise.withResolvers<void>();
+    messenger.beforeSend = async output => {
+      if (output.text.includes("pr-review") && output.text.includes(sha)) offered.resolve();
+    };
+    await runtime.start();
+    await owner(runtime, message("11000", parent, '/cron pr-add "every 5m" dbc-hbin/project'));
+    const job = store.output("11000:head-control")?.text.match(/[a-f0-9-]{36}/)?.[0];
+    if (!job) throw new Error("Missing PR enrollment");
+    await owner(runtime, message("11001", parent, `/cron run ${job}`));
+    await offered.promise;
+    await owner(runtime, message("11002", parent, `/cron pr-review ${job} 12 ${sha}`));
+    const lane = store.lanes()[0];
+    const host = lane && hosts.get(lane.socketPath);
+    if (!lane || !host) throw new Error("Missing static review lane");
+    await host.whenPrompts(1);
+    const handoffId = "handoff:11002:lane";
+    await admit(runtime, message("11003", lane.route, modelCommand));
+    expect(store.input("11003")?.state).toBe("cancelled"); // No prior quota.
+    failLaneRun(host, codexQuota, false);
+    await waitForOutput(messenger, `${handoffId}:answer`);
+    expect(store.output(`${handoffId}:answer`)?.text).toContain("/model을 열고 현재 레인 → 공급자 → 모델");
+    await runtime.kick();
+    expect(store.input(handoffId)?.state).toBe("cancelled");
+    expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBe(handoffId);
+    await expect(runtime.changeModel({ id: lane.id, sourceId: "11002", model: otherModel, modelReason: "Manager cannot replace a held review model." })).rejects.toThrow();
+    await admit(runtime, message("11004", parent, modelCommand));
+    await admit(runtime, { ...message("11005", lane.route, modelCommand), discordOriginalText: "/voice confirm" });
+    expect(store.input("11004")?.state).toBe("cancelled");
+    expect(store.input("11005")?.state).toBe("cancelled");
+    expect(host.commands.filter(command => /^set_.*model/.test(String(command.type)))).toEqual([]);
+    let active = host;
+    if (method === "typed command") {
+      await owner(runtime, message("11007", lane.route, modelCommand));
+      expect(store.input("11007")?.state).toBe("done");
+    } else if (method === "readback after catalogue ambiguity") {
+      const openChoice = async (id: string) => {
+        await owner(runtime, message(id, lane.route, "/model"));
+        const card = store.output(`${id}:head-control`);
+        if (card?.picker?.kind !== "model" || !card.picker.modelTargets?.lane?.allowedOptions?.[1]?.includes(1))
+          throw new Error("Expected the exact review model in a fresh card");
+        return pickerClick(card, 1, 1, { target: "lane" });
+      };
+      host.modelSetResult = "throw-after";
+      const first = await openChoice("11071");
+      await admit(runtime, first);
+      expect(store.input(first.id)?.state).toBe("cancelled");
+      expect(host.state.model).toEqual(otherModel);
+      expect(store.lane(lane.id)?.model).toEqual(codexModel);
+      host.modelSetResult = "success";
+
+      const nowAmbiguous = await openChoice("11072");
+      const duplicate = { ...otherModel, api: "anthropic-messages" };
+      main.models.push(duplicate);
+      await admit(runtime, nowAmbiguous);
+      expect(store.input(nowAmbiguous.id)?.state).toBe("cancelled");
+      expect(store.lane(lane.id)?.model).toEqual(codexModel);
+      expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBe(handoffId);
+      expect(host.commands.filter(command => command.type === "set_pr_review_model")).toHaveLength(1);
+
+      main.models = main.models.filter(model => model !== duplicate);
+      const exactAgain = await openChoice("11073");
+      await admit(runtime, exactAgain);
+      expect(store.input(exactAgain.id)?.state).toBe("done");
+    } else {
+      host.shutdownDisconnect = true;
+      const { idleMs } = config;
+      config.idleMs = 0;
+      try { await runtime.kick(); }
+      finally { config.idleMs = idleMs; }
+      const cold = store.lane(lane.id);
+      expect(cold).toMatchObject({ runtimeState: "unloaded", sessionId: host.state.sessionId, pid: null });
+      if (!cold) throw new Error("Expected the saved cold review lane");
+      await owner(runtime, message("11006", lane.route, "/model"));
+      const card = store.output("11006:head-control");
+      if (card?.picker?.kind !== "model") throw new Error("Expected a model card in the cold review topic");
+      expect(card.picker.groups).toEqual([
+        { label: "gemini", options: ["gemini/gemini-fixture"] },
+        { label: "fixture", options: ["fixture/capable", "fixture/efficient", "fixture/native-harness", "fixture/duplicate", "fixture/with space"] },
+        { label: "gitlab-duo", options: ["gitlab-duo/duo-fixture"] },
+        { label: "openai-codex", options: [`openai-codex/${codexModel.id}`] },
+      ]);
+      expect(card.picker.modelTargets?.lane).toMatchObject({
+        id: lane.id, generation: cold.generation, sessionId: cold.sessionId, allowedOptions: [[], [1], [], [0]],
+      });
+      expect(launched).toHaveLength(1); // Opening the card is not a restore.
+      const hidden = pickerClick(card, 1, 2, { target: "lane" });
+      await expect(admit(runtime, hidden)).rejects.toThrow("Picker selection does not match");
+      expect(store.input(hidden.id)).toBeNull();
+      expect(launched).toHaveLength(1);
+      const group = card.picker.groups.findIndex(candidate => candidate.label === otherModel.provider);
+      const option = card.picker.groups[group]?.options.indexOf(`${otherModel.provider}/${otherModel.id}`) ?? -1;
+      const click = pickerClick(card, group, option, { target: "lane" });
+      if (method === "stale cold picker" || method === "replaced journal") {
+        if (method === "replaced journal") legacyTranscript({ ...cold, id: "different-review-session" }, codexModel);
+        else main.beforeCatalog = () => { main.beforeCatalog = undefined; store.nextGeneration(lane.id); };
+        await admit(runtime, click);
+        expect(store.input(click.id)?.state).toBe("cancelled");
+        expect(launched).toHaveLength(1);
+        if (method === "replaced journal") expect(store.lane(lane.id)).toMatchObject({ generation: cold.generation, pid: null });
+        expect(store.lane(lane.id)?.model).toEqual(codexModel);
+        expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBe(handoffId);
+        expect(main.state.model).toEqual(codexModel);
+        return;
+      }
+      await admit(runtime, click);
+      await admit(runtime, click);
+      const restored = hosts.get(lane.socketPath);
+      if (!restored) throw new Error("Expected the restored review Host");
+      active = restored;
+      expect(store.input(click.id)?.state).toBe("done");
+      expect(store.lane(lane.id)).toMatchObject({ sessionId: cold.sessionId, generation: cold.generation + 1 });
+      expect(active.state.sessionId).toBe(host.state.sessionId);
+      expect(active.prompts).toEqual([]);
+    }
+    expect(store.lane(lane.id)?.model).toEqual(otherModel);
+    expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBe("");
+    expect(active.state.model).toEqual(otherModel);
+    expect(active.commands.filter(command => /^set_.*model/.test(String(command.type)))).toMatchObject([
+      { type: "set_pr_review_model", provider: "fixture", modelId: "efficient",
+        previousProvider: "openai-codex", previousModelId: codexModel.id },
+    ]);
+    expect(host.prompts.map(prompt => prompt.id)).toEqual([nativeRequestId(store, handoffId)]);
+    expect(launched.map(options => options.prReviewOnly)).toEqual(coldPicker ? [true, true] : [true]);
+    expect(main.state.model).toEqual(codexModel);
+    expect(main.prompts).toEqual([]);
+    await owner(runtime, message("11008", lane.route, `/cron pr-review ${job} 12 ${sha}`));
+    const next = coldPicker ? 0 : 1;
+    await active.whenPrompts(next + 1);
+    expect(active.prompts[next]?.command.message).toStartWith(PR_REVIEW_INPUT_PREFIX);
+    expect(active.prompts[next]?.id).toBe(nativeRequestId(store, `handoff:11008:${lane.id}`));
+  });
+
+  test("a Discord lane selection clears confirmed quota without replay while HEAD is busy", async () => {
+    const instance = fixture();
+    const { runtime, store, main, messenger } = instance;
+    const { lane, worker } = codexLane(instance, "quota-picker-lane");
+    const work = message("quota-picker-work", lane.route, "Check this invoice.");
+    const handoff = `handoff:${work.id}:${lane.id}`;
+    const headWork = headMessage("quota-picker-head", route("another-topic"), "Continue the unrelated HEAD task.");
+    await runtime.start();
+    await admit(runtime, work);
+    await worker.whenPrompts(1);
+    const failedRequest = nativeRequestId(store, handoff);
+    failLaneRun(worker, codexQuota, false);
+    await waitForOutput(messenger, `${handoff}:answer`);
+    expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBe(handoff);
+    await admit(runtime, headWork);
+    await main.whenPrompts(1);
+
+    const open = applicationCommand("11009", lane.route, "/model");
+    await admit(runtime, open);
+    const card = messenger.sent.find(output => output.sourceId === open.id);
+    if (!card?.picker) throw new Error("Expected a scoped menu for the quota-held lane");
+    expect(card).toMatchObject({ route: lane.route, picker: {
+      kind: "model", current: "fixture/capable", currentProvider: "fixture",
+      modelTargets: { lane: {
+        id: lane.id, sessionId: worker.state.sessionId, generation: lane.generation,
+        current: `${codexModel.provider}/${codexModel.id}`, currentProvider: codexModel.provider,
+      } },
+    } });
+    const click = pickerClick(card, 0, 1, { target: "lane" });
+    expect(card.picker.groups[0]?.options[1]).toBe("fixture/efficient");
+    expect(main.state.model).toEqual(executionModel);
+    expect(worker.state.model).toEqual(codexModel);
+    await admit(runtime, click);
+    await admit(runtime, click);
+
+    expect(store.input(click.id)?.state).toBe("done");
+    expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBe("");
+    expect(store.input(handoff)?.state).toBe("cancelled");
+    expect(store.lane(lane.id)?.model).toEqual(otherModel);
+    expect(worker.state.model).toEqual(otherModel);
+    expect(worker.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
+    expect(messenger.sent.filter(output => output.sourceId === click.id)).toMatchObject([
+      { route: lane.route, text: expect.stringContaining("fixture/efficient") },
+    ]);
+    expect(main.state.model).toEqual(executionModel);
+    expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+    expect(store.input(headWork.id)?.state).toBe("submitted");
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([nativeRequestId(store, headWork.id)]);
+    expect(worker.prompts.map(prompt => prompt.id)).toEqual([failedRequest]);
+  });
+
+  test.each([
+    ["topic", false, "cancelled"],
+    ["delegated", false, "cancelled"],
+    ["topic after an observed tool", true, "uncertain"],
+  ] as const)("confirmed Codex quota (%s) sends one safe notice on the original route without prompting HEAD", async (mode, toolStarted, state) => {
+    const instance = fixture();
+    const { runtime, config, store, hosts, main, messenger } = instance;
+    config.discord!.allowedChannelIds.push("5");
+    const { lane, worker } = codexLane(instance, "quota-lane");
+    const original = mode === "delegated"
+      ? headMessage("lane-quota-source", route(null, { channelId: "5" }), "Ask the existing lane to check the invoice.")
+      : message("lane-quota-source", lane.route, "Check the invoice.");
+
+    await runtime.start();
+    await admit(runtime, original);
+    const headPrompts = mode === "delegated" ? 1 : 0;
+    if (mode === "delegated") {
+      await runtime.messageLane(lane.id, "Check the invoice as requested.", original.id);
+      main.complete("");
+    }
+    await worker.whenPrompts(1);
+    const handoffId = `handoff:${original.id}:${lane.id}`;
+    const requestId = nativeRequestId(store, handoffId);
+    const failure = failLaneRun(worker, codexQuota, toolStarted);
+    await messenger.whenSent(1);
+    worker.emit(failure); // A duplicate terminal receipt does not send a second notice.
+    await admit(runtime, original);
+
+    expect(store.input(handoffId)?.state).toBe(state);
+    expect(store.lane(lane.id)).toMatchObject({ model: codexModel, workState: "open", generation: lane.generation });
+    expect(main.prompts).toHaveLength(headPrompts);
+    expect(worker.prompts.map(prompt => prompt.id)).toEqual([requestId]);
+    expect(messenger.attempted).toHaveLength(1);
+    expect(messenger.sent).toMatchObject([{
+      route: original.route, replyTo: { route: original.route, messageId: original.messageId },
+    }]);
+    const notice = messenger.sent[0];
+    if (!notice) throw new Error("Missing quota notice");
+    expect(store.ownerSource(notice.sourceId)?.id).toBe(original.id);
+    expect(notice.text).toMatch(/quota|쿼터|한도/i);
+    expect(notice.text).toContain("/model을 열고 현재 레인 → 공급자 → 모델");
+    expect(notice.text).not.toMatch(/private-provider\.invalid|private-lane-token/);
+    if (toolStarted) {
+      const sibling = savedLane(store, config, "unrelated-quota-topic", route("55"));
+      const resolve = `/resolve --lane ${handoffId}`;
+      expect(notice.text).toContain(resolve);
+      await admit(runtime, message("resolve-other-topic", sibling.route, resolve));
+      await admit(runtime, message("model-while-held", lane.route, modelCommand));
+      expect(store.input(handoffId)?.state).toBe("uncertain");
+      expect(worker.state.model).toEqual(codexModel);
+      expect(worker.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+
+      await admit(runtime, message("resolve-original-topic", lane.route, resolve));
+      await expect(runtime.changeModel({
+        id: lane.id, sourceId: original.id, model: otherModel, modelReason: "Inferred replacement after quota exhaustion.",
+      })).rejects.toThrow();
+      await admit(runtime, message("model-unbound-topic", route("66"), modelCommand));
+      await admit(runtime, message("model-unavailable", lane.route, "/model --lane fixture/unavailable"));
+      expect(worker.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+      const choose = message("model-original-topic", lane.route, modelCommand);
+      await admit(runtime, choose);
+      await admit(runtime, choose);
+      expect(store.input(handoffId)?.state).toBe("cancelled");
+      expect(store.input("resolve-other-topic")?.state).toBe("cancelled");
+      expect(store.input("model-while-held")?.state).toBe("cancelled");
+      expect(store.input("model-unbound-topic")?.state).toBe("cancelled");
+      expect(store.input("model-unavailable")?.state).toBe("cancelled");
+      expect(store.input(choose.id)?.state).toBe("done");
+      expect(store.lane(lane.id)?.model).toEqual(otherModel);
+      expect(worker.state.model).toEqual(otherModel);
+      expect(worker.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
+      await waitForOutput(messenger, `${choose.id}:head-control`);
+      expect(messenger.sent.filter(output => output.sourceId === choose.id)).toMatchObject([
+        { route: lane.route, text: expect.stringContaining("fixture/efficient") },
+      ]);
+      expect(main.prompts).toEqual([]);
+      expect(worker.prompts.map(prompt => prompt.id)).toEqual([requestId]);
+      expect(hosts.has(sibling.socketPath)).toBe(false);
+      expect(store.lane(sibling.id)?.model).toEqual(executionModel);
+
+      // A cleared hold is not a live quota receipt. The next exact operator
+      // selection may switch back without stranding a valueless hold marker.
+      const switchBack = message("model-after-quota-cleared", lane.route, `/model --lane ${codexModel.provider}/${codexModel.id}`);
+      await admit(runtime, switchBack);
+      expect(store.input(switchBack.id)?.state).toBe("done");
+      expect(store.lane(lane.id)?.model).toEqual(codexModel);
+      expect(worker.commands.filter(command => command.type === "set_lane_model")).toHaveLength(2);
+
+      const newWork = message("new-work-after-model-change", lane.route, "Check the next invoice separately.");
+      await admit(runtime, newWork);
+      expect(worker.prompts.map(prompt => prompt.id)).toEqual([
+        requestId, nativeRequestId(store, `handoff:${newWork.id}:${lane.id}`),
+      ]);
+      expect(worker.prompts[1]?.command.message).toContain(newWork.text);
+      expect(main.prompts).toEqual([]);
+    }
+    expect(messenger.threads).toEqual([]);
+  });
+
+  test.each([
+    ["quota", "cancelled", "already journaled"],
+    ["success", "done", "already journaled"],
+    ["quota", "cancelled", "on lane settlement"],
+    ["quota", "cancelled", "before HEAD forwarding"],
+    ["quota", "cancelled", "after a failed final readback"],
+  ] as const)("recovers journaled lane %s without replay (%s, %s)", async (outcome, state, timing) => {
+    const instance = fixture();
+    const { runtime, store, main, messenger } = instance;
+    const { lane, worker } = codexLane(instance, "journaled-lane");
+    const original = message("missing-lane-ack", lane.route, "Check the original invoice.");
+    const handoffId = `handoff:${original.id}:${lane.id}`;
+    const answer = "The original invoice reconciles to 417.";
+    const earlyJournalRead = Promise.withResolvers<void>();
+    const terminal: unknown[] = [];
+    // Earlier native work is outside the admission's captured journal cursor.
+    worker.entries.push(
+      { id: "earlier-lane-user", type: "message", message: { role: "user", content: "Inspect a previous invoice." } },
+      { id: "earlier-lane-answer", type: "message", message: { role: "assistant", stopReason: "stop",
+        content: [{ type: "text", text: "Earlier invoice finding, not the original answer." }] } },
+    );
+    worker.beforePrompt = () => {
+      // Model the Host having settled and committed the journal before its
+      // reply transport failed. No live assistant, receipt, or settle frames.
+      worker.beforePrompt = undefined;
+      const prompt = worker.prompts.at(-1);
+      if (!prompt) throw new Error("Missing admitted native request");
+      const run = { sessionId: worker.state.sessionId, sessionFile: worker.state.sessionFile,
+        hostPid: worker.state.hostPid, instanceKey: "silent-lane-host", runOrdinal: 1 };
+      const assistant = { role: "assistant", provider: codexModel.provider, model: codexModel.id,
+        ...(outcome === "quota" ? { stopReason: "error", errorMessage: codexQuota, content: [] }
+          : { stopReason: "stop", content: [{ type: "text", text: answer }] }) };
+      const frame = { type: "prompt_result", id: prompt.id, agentInvoked: true, sessionSettled: true,
+        ...(outcome === "quota" ? { status: "error",
+          error: { provider: codexModel.provider, model: codexModel.id, retryable: false, message: codexQuota } }
+          : { status: "completed" }) };
+      worker.entries.push(
+        { id: `start-${prompt.id}`, type: "custom", customType: "rpc_agent_start", data: run },
+        { id: `user-${prompt.id}`, type: "message", message: { role: "user", content: prompt.command.message } },
+      );
+      terminal.push(
+        { id: `assistant-${prompt.id}`, type: "message", message: assistant },
+        { id: `receipt-${prompt.id}`, type: "custom", customType: "rpc_prompt_result", timestamp: new Date().toISOString(),
+          data: { ...run, frame } },
+      );
+      if (timing === "already journaled") worker.entries.push(...terminal);
+      else worker.afterEntries = () => {
+        // The transport already captured the response without the final receipt.
+        worker.afterEntries = undefined;
+        earlyJournalRead.resolve();
+      };
+      throw new Error("Native prompt acknowledgement was lost after settlement");
+    };
+
+    await runtime.start();
+    if (outcome === "quota") await admit(runtime, headMessage("busy-other-owner-task", route(null)));
+    const headBeforeFailure = main.prompts.map(prompt => prompt.id);
+    await admit(runtime, original);
+    if (timing !== "already journaled") {
+      await earlyJournalRead.promise;
+      worker.entries.push(...terminal);
+      if (timing === "after a failed final readback") {
+        const outage = Promise.withResolvers<void>();
+        const recovered = Promise.withResolvers<void>();
+        worker.afterEntries = () => {
+          worker.afterEntries = undefined;
+          worker.beforeState = async () => {
+            outage.resolve();
+            await recovered.promise;
+            worker.beforeState = undefined;
+            throw new Error("Lost final quota confirmation");
+          };
+        };
+        main.complete("");
+        await outage.promise;
+        expect(store.input(`report:${handoffId}`)?.state).toBe("pending");
+        recovered.resolve();
+      }
+      else if (timing === "on lane settlement") worker.emit({ type: "session_settled" });
+      else main.complete(""); // No new lane frame: check again before forwarding to HEAD.
+    }
+    await messenger.whenSent(1);
+    await admit(runtime, original);
+
+    const requestId = nativeRequestId(store, handoffId);
+    expect(store.input(handoffId)?.state).toBe(state);
+    expect(worker.prompts.map(prompt => prompt.id)).toEqual([requestId]);
+    expect(main.prompts.map(prompt => prompt.id)).toEqual(headBeforeFailure);
+    expect(messenger.attempted).toHaveLength(1);
+    expect(messenger.sent).toMatchObject([{
+      route: original.route, replyTo: { route: original.route, messageId: original.messageId },
+    }]);
+    const reply = messenger.sent[0];
+    if (!reply) throw new Error("Missing original-route journal recovery output");
+    expect(store.ownerSource(reply.sourceId)?.id).toBe(original.id);
+    if (outcome === "quota") {
+      expect(reply.text).toMatch(/quota|쿼터|한도/i);
+      expect(reply.text).toContain("/model을 열고 현재 레인 → 공급자 → 모델");
+      expect(reply.text).not.toMatch(/private-provider\.invalid|private-lane-token/);
+      const later = message("work-held-after-silent-quota", lane.route, "Check the next invoice.");
+      const laterId = `handoff:${later.id}:${lane.id}`;
+      await admit(runtime, later);
+      expect(store.input(laterId)?.state).toBe("pending");
+      expect(worker.prompts.map(prompt => prompt.id)).toEqual([requestId]);
+
+      await admit(runtime, message("choose-after-silent-quota", lane.route, modelCommand));
+      await worker.whenPrompts(2);
+      expect(worker.state.model).toEqual(otherModel);
+      expect(store.input(laterId)?.state).toBe("submitted");
+      expect(worker.prompts.map(prompt => prompt.id)).toEqual([requestId, nativeRequestId(store, laterId)]);
+      expect(worker.prompts[1]?.command.message).toContain(later.text);
+      expect(main.prompts.map(prompt => prompt.id)).toEqual(headBeforeFailure);
+    } else {
+      expect(reply.text).toBe(answer);
+    }
+  });
+
+  test("a lost settlement readback holds the lane until its receipt can be confirmed without replay", async () => {
+    const instance = fixture();
+    const { runtime, store, main, messenger } = instance;
+    const { lane, worker } = codexLane(instance, "readback-error");
+    const source = message("failed-readback", lane.route);
+    await runtime.start();
+    await admit(runtime, source);
+    const id = `handoff:${source.id}:${lane.id}`;
+    const dropped = Promise.withResolvers<void>();
+    worker.afterEntries = () => {
+      worker.afterEntries = undefined;
+      worker.beforeState = () => {
+        worker.beforeState = undefined;
+        dropped.resolve();
+        throw new Error("Lost post-journal state readback");
+      };
+    };
+    failLaneRun(worker, codexQuota, false);
+    await dropped.promise;
+    await runtime.kick();
+    await messenger.whenSent(1);
+    expect(store.input(id)?.state).toBe("cancelled");
+    expect(store.getMeta(`lane-quota-hold:${lane.id}`)).toBe(id);
+    expect(worker.prompts.map(prompt => prompt.id)).toEqual([nativeRequestId(store, id)]);
+    expect(main.prompts).toHaveLength(0);
+    expect(messenger.attempted).toHaveLength(1);
+  });
+
+  test.each([
+    ["HTTP 429 Too Many Requests", false, "cancelled"],
+    ["HTTP 503 Service Unavailable", true, "uncertain"],
+  ] as const)("ordinary %s from a bound topic is reported only to HEAD for safe recovery", async (error, toolStarted, state) => {
+    const instance = fixture();
+    const { runtime, config, directory, store, hosts, main, messenger } = instance;
+    const { lane, worker } = codexLane(instance, "failed-topic");
+    const sibling = savedLane(store, config, "unrelated-topic", route("55"));
+    const original = message("failed-topic-source", lane.route, "Inspect the importer.");
+    const handoffId = `handoff:${original.id}:${lane.id}`;
+    const reportId = `report:${handoffId}`;
+    await runtime.start();
+    await admit(runtime, original);
+    await worker.whenPrompts(1);
+    const requestId = nativeRequestId(store, handoffId);
+
+    failLaneRun(worker, `${error} at ${privateDiagnostic}`, toolStarted);
+    await main.whenPrompts(1);
+    await runtime.kick();
+
+    expect(store.input(handoffId)?.state).toBe(state);
+    expect(store.input(reportId)).toMatchObject({ target: "main", route: original.route, state: "submitted" });
+    expect(main.prompts.map(prompt => prompt.id)).toEqual([nativeRequestId(store, reportId)]);
+    expect(String(main.prompts[0]?.command.message)).not.toMatch(/private-provider\.invalid|private-lane-token/);
+    expect(messenger.attempted).toEqual([]);
+    expect(worker.prompts.map(prompt => prompt.id)).toEqual([requestId]);
+
+    const correction = "Read the importer status without rerunning the failed request.";
+    const differentOwner = message("unrelated-admitted-owner", route(null), "Check separate work.");
+    store.receive(differentOwner, "main", { [`user-source:${differentOwner.id}`]: "true" });
+    store.settle(differentOwner.id, "done");
+    await expect(runtime.messageLane(lane.id, correction, original.id)).rejects.toThrow("active HEAD report ID");
+    await expect(runtime.messageLane(sibling.id, correction, differentOwner.id)).rejects.toThrow("active HEAD report ID");
+    await expect(runtime.changeModel({
+      id: lane.id, sourceId: original.id, model: otherModel, modelReason: correction,
+    })).rejects.toThrow("active HEAD report ID");
+    await expect(runtime.updateLaneThread({ id: sibling.id, sourceId: differentOwner.id, changes: { title: "Wrong thread" } }))
+      .rejects.toThrow("cannot authorize this manager mutation");
+    await expect(runtime.pause(sibling.id)).rejects.toThrow("cannot authorize this manager mutation");
+    await expect(runtime.resume(sibling.id, differentOwner.id)).rejects.toThrow("cannot authorize this manager mutation");
+    await expect(runtime.closeLane(sibling.id, "cancelled", "Wrong thread"))
+      .rejects.toThrow("cannot authorize this manager mutation");
+    await expect(runtime.messageLane(sibling.id, correction, reportId)).rejects.toThrow();
+    await expect(runtime.changeModel({
+      id: sibling.id, sourceId: reportId, model: otherModel, modelReason: correction,
+    })).rejects.toThrow();
+    await expect(runtime.startLane({
+      ...selection, sourceId: reportId, cwd: directory, title: "Unrelated correction", kickoff: correction,
+    })).rejects.toThrow();
+    if (toolStarted) {
+      await expect(runtime.messageLane(lane.id, correction, reportId)).rejects.toThrow();
+    } else {
+      await runtime.changeModel({ id: lane.id, sourceId: reportId, model: otherModel, modelReason: "Use the available fallback for the remaining check." });
+      expect(worker.state.model).toEqual(otherModel);
+      const followup = await runtime.messageLane(lane.id, correction, reportId);
+      await worker.whenPrompts(2);
+      expect(store.input(followup.inputId)).toMatchObject({ target: lane.id, text: correction, state: "submitted" });
+      expect(worker.prompts.map(prompt => prompt.id)).toEqual([
+        requestId, nativeRequestId(store, followup.inputId),
+      ]);
+      expect(worker.prompts[1]?.command.message).toContain(correction);
+    }
+    main.complete("HEAD reviewed the failed run.");
+    await messenger.whenSent(1);
+    expect(messenger.sent).toMatchObject([{ route: original.route, text: "HEAD reviewed the failed run." }]);
+    await expect(runtime.messageLane(lane.id, "Reuse this now-settled report.", reportId)).rejects.toThrow();
+
+    expect(main.prompts).toHaveLength(1);
+    expect(hosts.has(sibling.socketPath)).toBe(false);
+    expect(store.lane(sibling.id)?.model).toEqual(executionModel);
+    expect(messenger.threads).toEqual([]);
+  });
+
+  test.each([["before dispatch", "cancelled"], ["during review", "uncertain"]] as const)(
+    "lane recovery stops when the separate original owner receipt closes %s (%s)", async (phase, state) => {
+      const { runtime, config, store, main, messenger, launched } = fixture();
+      const sourceLane = savedLane(store, config, "paused-original-source", route("66"));
+      const lane = savedLane(store, config, "recovery-target", route("44"));
+      store.updateLane(sourceLane.id, sourceLane.generation, { workState: "paused" });
+      await runtime.start();
+      // Preserve an independently actionable owner receipt which cannot itself
+      // drive HEAD. Closing it does not change the failed lane's receipt.
+      const original = message("separate-original-owner", sourceLane.route);
+      const failure = message(`handoff:${original.id}:${lane.id}`, lane.route, "Previously authorized placement");
+      const reportId = `report:${failure.id}`;
+      store.receive(original, sourceLane.id, { [`user-source:${original.id}`]: "true" });
+      store.receive(failure, lane.id, { [`handoff-source:${failure.id}`]: original.id });
+      store.submit(failure.id, "already-settled-lane-native", lane.generation);
+      store.settle(failure.id, "cancelled", { id: "failure-result", text: "Provider refusal", laneFailure: "recover" });
+      if (phase === "during review") {
+        await runtime.kick();
+        await main.whenPrompts(1);
+        expect(store.input(reportId)?.state).toBe("submitted");
+      }
+
+      expect(store.settle(original.id, state)).toBe(true);
+      if (phase === "during review") {
+        await expect(runtime.messageLane(lane.id, "No longer authorized", reportId)).rejects.toThrow("current owner authority");
+        main.complete("Obsolete recovery update.");
+      }
+      const next = headMessage("next-ordinary-request", route(null));
+      await admit(runtime, next);
+      await main.whenPrompts(phase === "during review" ? 2 : 1);
+
+      expect(store.input(failure.id)?.state).toBe("cancelled");
+      expect(store.input(reportId)?.state).toBe(phase === "before dispatch" ? "cancelled" : "done");
+      expect(store.input(`handoff:${reportId}:${lane.id}`)).toBeNull();
+      expect(main.prompts.map(prompt => prompt.id)).toEqual(phase === "before dispatch" ? [nativeRequestId(store, next.id)]
+        : [nativeRequestId(store, reportId), nativeRequestId(store, next.id)]);
+      expect(messenger.attempted).toEqual([]);
+      expect(launched).toEqual([]);
+    },
+  );
+
+  test.each(["queued", "active"] as const)("newer bound operator model choices supersede %s recovery even after A to B to A", async phase => {
+    const instance = fixture();
+    const { runtime, store, main, messenger } = instance;
+    const { lane, worker } = codexLane(instance, "newer-operator-model");
+    const original = message("older-failed-input", lane.route, "Inspect the importer.");
+    const handoff = `handoff:${original.id}:${lane.id}`;
+    const reportId = `report:${handoff}`;
+    await runtime.start();
+    if (phase === "queued") await admit(runtime, headMessage("unrelated-busy-head", route(null)));
+    await admit(runtime, original);
+    await worker.whenPrompts(1);
+    const recorded = Promise.withResolvers<void>();
+    const setMeta = store.setMeta.bind(store);
+    const observer = spyOn(store, "setMeta").mockImplementation((key, value) => {
+      setMeta(key, value);
+      if (key === `lane-recovery-owner:${reportId}`) recorded.resolve();
+    });
+    failLaneRun(worker, "HTTP 503 Service Unavailable", false);
+    await recorded.promise;
+    observer.mockRestore();
+    if (phase === "active") await main.whenPrompts(1);
+    expect(store.input(reportId)?.state).toBe(phase === "queued" ? "pending" : "submitted");
+
+    for (const [id, selector, selected] of [
+      ["choose-new-model", "fixture/efficient", otherModel],
+      ["restore-original-model", `${codexModel.provider}/${codexModel.id}`, codexModel],
+    ] as const) {
+      const control = message(id, lane.route, `/model --lane ${selector}`);
+      await admit(runtime, control);
+      await waitForOutput(messenger, `${id}:head-control`);
+      expect(store.input(id)?.state).toBe("done");
+      expect(store.lane(lane.id)?.model).toEqual(selected);
+      expect(worker.state.model).toEqual(selected);
+    }
+    await expect(runtime.messageLane(lane.id, "Old recovery correction", reportId)).rejects.toThrow("current owner authority");
+    await expect(runtime.changeModel({ id: lane.id, sourceId: reportId, model: otherModel, modelReason: "Old recovery choice" }))
+      .rejects.toThrow("current owner authority");
+    main.complete(phase === "queued" ? "" : "Obsolete recovery update.");
+    const next = headMessage("next-after-operator-choice", route(null));
+    await admit(runtime, next);
+    await main.whenPrompts(2);
+
+    expect(store.input(reportId)?.state).toBe(phase === "queued" ? "cancelled" : "done");
+    expect(store.input(`handoff:${reportId}:${lane.id}`)).toBeNull();
+    expect(worker.prompts.map(prompt => prompt.id)).toEqual([nativeRequestId(store, handoff)]);
+    expect(worker.commands.filter(command => command.type === "set_lane_model")).toHaveLength(2);
+    expect(messenger.attempted.map(output => output.id)).toEqual(["choose-new-model:head-control", "restore-original-model:head-control"]);
+  });
+
+  test("a parent-origin lane recovery keeps native approvals on the parent through correction and descendant report", async () => {
+    const instance = fixture();
+    const { runtime, store, main, messenger } = instance;
+    const { lane, worker } = codexLane(instance, "parent-approval-recovery");
+    const original = headMessage("parent-corrected-request", route(null), "Verify the existing importer.");
+    const confirmAtParent = async (host: HostTransport, target: string, id: string) => {
+      const frame = { type: "extension_ui_request", id, method: "confirm", title: "Confirm", message: "Review this step?" };
+      host.state.pendingUiRequests = [frame];
+      host.emit(frame);
+      await messenger.whenApproval();
+      const card = [...messenger.shown.values()].find(approval => approval.requestId === id);
+      if (!card || !messenger.handlers) throw new Error(`Missing original-route approval ${id}`);
+      expect(card).toMatchObject({ route: original.route, target });
+      await expect(messenger.handlers.answer(card.id, { confirmed: true }, lane.route)).rejects.toThrow("Stale or foreign approval");
+      await messenger.handlers.answer(card.id, { confirmed: true }, original.route);
+      messenger.shown.delete(card.id);
+    };
+    await runtime.start();
+    await admit(runtime, original);
+    await main.whenPrompts(1);
+    const delegated = await runtime.messageLane(lane.id, "Verify the existing importer.", original.id);
+    await worker.whenPrompts(1);
+    main.complete("");
+    failLaneRun(worker, "HTTP 503 Service Unavailable", false);
+
+    await main.whenPrompts(2);
+    const reportId = `report:${delegated.inputId}`;
+    expect(main.prompts[1]?.id).toBe(nativeRequestId(store, reportId));
+    await confirmAtParent(main, "main", "failed-lane-report-approval");
+    const corrected = await runtime.messageLane(lane.id, "Verify the importer without replaying the failed action.", reportId);
+    await worker.whenPrompts(2);
+    await confirmAtParent(worker, lane.id, "corrective-lane-approval");
+    main.complete("");
+    worker.complete("The importer check passed.");
+
+    await main.whenPrompts(3);
+    const descendant = `report:${corrected.inputId}`;
+    expect(main.prompts[2]?.id).toBe(nativeRequestId(store, descendant));
+    await confirmAtParent(main, "main", "descendant-report-approval");
+    main.complete("Verified the importer in the existing work thread.");
+    await waitForOutput(messenger, `${descendant}:answer`);
+
+    expect(messenger.sent).toMatchObject([{ sourceId: descendant, route: lane.route }]);
+    expect(messenger.sent[0]?.replyTo).toBeUndefined();
+    expect(messenger.threads).toEqual([]);
+  });
+
+  test.each(["unbound", "missing source", "wrong source", "ambiguous", "restored admission", "saved card",
+    "changed dialog", "manager-only"] as const)(
+    "corrective dialog routing after reconnect: %s", async scenario => {
+      const instance = fixture();
+      const { runtime, config, directory, store, main } = instance;
+      const { lane, worker } = codexLane(instance, "detached-corrective-approval");
+      const managerOnly = scenario === "manager-only";
+      const original = headMessage("detached-approval-parent", managerOnly ? lane.route : route(null), "Verify the existing importer.");
+      await runtime.start();
+      await admit(runtime, original);
+      await main.whenPrompts(1);
+      const failed = await runtime.messageLane(lane.id, original.text, original.id);
+      await worker.whenPrompts(1);
+      main.complete("");
+      failLaneRun(worker, "HTTP 503 Service Unavailable", false);
+      await main.whenPrompts(2);
+      const reportId = `report:${failed.inputId}`;
+      const correction = await runtime.messageLane(lane.id, "Inspect the importer without replaying the failed action.", reportId);
+      await worker.whenPrompts(2);
+      const requestId = nativeRequestId(store, correction.inputId);
+      const frame = { type: "extension_ui_request", method: "confirm", id: "first-corrective-dialog", title: "Proceed?" };
+      const cardId = `a-${createHash("sha256").update(`${lane.id}:${lane.generation}:${frame.id}`).digest("hex").slice(0, 24)}`;
+      const saved = scenario === "saved card" || scenario === "changed dialog";
+      if (saved) {
+        worker.state.pendingUiRequests = [frame];
+        worker.emit(frame);
+        await instance.messenger.whenApproval();
+        expect(store.approval(cardId)).toMatchObject({ route: original.route, request: frame });
+      }
+      expect(store.reportApprovalSource(correction.inputId)?.id).toBe(managerOnly ? undefined : original.id);
+      if (scenario === "missing source") {
+        const db = new Database(join(directory, "coordination.sqlite"));
+        try { db.query("DELETE FROM metadata WHERE key = ?").run(`report-approval-source:${reportId}`); }
+        finally { db.close(); }
+      }
+      if (scenario === "wrong source") store.setMeta(`report-approval-source:${reportId}`, failed.inputId);
+      if (scenario === "missing source" || scenario === "wrong source")
+        expect(store.reportApprovalSource(correction.inputId)).toBeNull();
+      if (scenario === "ambiguous") {
+        const other = message("competing-lane-admission", lane.route);
+        store.receive(other, lane.id);
+        expect(store.submit(other.id, "competing-native-request", lane.generation)).toBe(true);
+      }
+      if (scenario === "restored admission") {
+        store.setMeta(`head:rotation-residents:${main.state.sessionId}`, JSON.stringify({
+          generation: "0", sessionFile: main.state.sessionFile,
+          residents: [{ id: lane.id, generation: lane.generation, sessionId: worker.state.sessionId,
+            pid: worker.state.hostPid, inputId: correction.inputId, requestIds: [requestId], ownedRuns: 1,
+            entryId: `user-${requestId}` }],
+        }));
+      }
+      await runtime.stop();
+
+      const reopened = new Store(join(directory, "coordination.sqlite"));
+      const resident = new HostTransport(lane.sessionFile, worker.state.sessionId, codexModel);
+      const nativeFrame = scenario === "changed dialog" ? { ...frame, title: "A different native request" } : frame;
+      resident.state = { ...worker.state, pendingUiRequests: [nativeFrame] };
+      resident.entries = worker.entries;
+      resident.journalLeaf = true;
+      const head = new HostTransport(hostPaths(config, "main").sessionFile, main.state.sessionId);
+      const messenger = new MessengerTransport();
+      const resumed = new Superagent(config, reopened, messenger, join(directory, "extension.ts"), () => {}, {
+        connect: async path => {
+          if (path === lane.socketPath) return resident;
+          if (path === hostPaths(config, "main").socketPath) return head;
+          throw new Error("Unexpected native owner");
+        },
+      });
+      const tracked = fixtures.find(entry => entry.runtime === runtime);
+      if (!tracked) throw new Error("Missing reconnect fixture");
+      tracked.runtime = resumed;
+      await resumed.start();
+      await messenger.handlers!.reconnect!();
+
+      const restored = scenario === "restored admission";
+      expect(reopened.input(correction.inputId)?.state).toBe(restored ? "submitted" : "uncertain");
+      expect(resident.prompts).toEqual([]);
+      expect(resident.responses).toEqual([]);
+      if (restored || scenario === "saved card" || managerOnly) {
+        expect([...messenger.shown.values()]).toMatchObject([{ id: cardId, route: original.route, target: lane.id, request: frame }]);
+        await expect(messenger.handlers!.answer(cardId, { confirmed: true }, managerOnly ? route(null) : lane.route))
+          .rejects.toThrow("Stale or foreign approval");
+        await messenger.handlers!.answer(cardId, { confirmed: true }, original.route);
+        expect(resident.responses).toEqual([{ id: frame.id, response: { confirmed: true } }]);
+      } else {
+        expect(messenger.shown.size).toBe(0);
+        expect(reopened.approvals(lane.id).map(card => card.id)).toEqual(saved ? [cardId] : []);
+        expect(resident.state.pendingUiRequests).toEqual([nativeFrame]);
+      }
+    },
+  );
+
+  test("reattaching to a still-running HEAD recovery does not grant ordinary manager authority", async () => {
+    const instance = fixture();
+    const { runtime, config, directory, store, main } = instance;
+    const { lane, worker } = codexLane(instance, "restart-recovery");
+    const sibling = savedLane(store, config, "unrelated-restart-lane", route("55"));
+    const original = message("failed-before-restart", lane.route);
+    await runtime.start();
+    await admit(runtime, original);
+    failLaneRun(worker, "HTTP 503 Service Unavailable", false);
+    await main.whenPrompts(1);
+    const report = `report:handoff:${original.id}:${lane.id}`;
+    expect(store.input(report)?.state).toBe("submitted");
+    await runtime.stop();
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const resident = new HostTransport(hostPaths(config, "main").sessionFile, main.state.sessionId);
+    resident.state.isSettled = false;
+    resident.state.isStreaming = true;
+    const restarted = new Superagent(config, reopened, new MessengerTransport(), join(directory, "extension.ts"), () => {}, {
+      connect: async path => {
+        if (path === hostPaths(config, "main").socketPath) return resident;
+        if (path === lane.socketPath) return new HostTransport(lane.sessionFile, worker.state.sessionId, codexModel);
+        throw new Error("Unexpected native owner");
+      },
+    });
+    const tracked = fixtures.find(entry => entry.runtime === runtime);
+    if (!tracked) throw new Error("Missing restart fixture");
+    tracked.runtime = restarted;
+    await restarted.start();
+    expect(reopened.input(report)?.state).toBe("uncertain");
+    await expect(restarted.pause(sibling.id)).rejects.toThrow("Lane recovery");
+    expect(reopened.lane(sibling.id)?.workState).toBe("open");
+    const settled = Promise.withResolvers<void>();
+    const setMeta = reopened.setMeta.bind(reopened);
+    spyOn(reopened, "setMeta").mockImplementation((key, value) => {
+      setMeta(key, value);
+      if (key === "main:active-lane-recovery" && value === "") settled.resolve();
+    });
+    resident.state.isStreaming = false;
+    resident.state.isSettled = true;
+    resident.emit({ type: "session_settled" });
+    await settled.promise;
+    expect(restarted.laneRecoveryActive()).toBe(false);
+  });
+
+  test("a recovered legacy topic report cannot authorize correction even while HEAD is reading it", async () => {
+    const { runtime, config, store, main, launched } = fixture();
+    const lane = savedLane(store, config, "legacy-report-topic", route("44"));
+    const source = message("legacy-report-source", lane.route);
+    store.receive(source, null, { [`user-source:${source.id}`]: "true", [`topic-owner:${source.id}`]: lane.id });
+    store.settle(source.id, "done");
+    const report = message(`report:handoff:${source.id}:${lane.id}`, lane.route, "Previously queued topic report");
+    store.receive(report, "main", { [`activity-source:${report.id}`]: source.id });
+
+    await runtime.start();
+    await main.whenPrompts(1);
+    expect(main.prompts[0]?.id).toBe(nativeRequestId(store, report.id));
+    await expect(runtime.messageLane(lane.id, "Start another attempt.", report.id)).rejects.toThrow();
+    expect(launched).toEqual([]);
+  });
+});
+
 describe("topic-owned lane delivery", () => {
   function placeTopicInput(store: Store, lane: Lane, source: Inbound, selectedDestination = false): string {
     const handoffId = `handoff:${source.id}:${selectedDestination ? "lane" : lane.id}`;
@@ -4082,6 +5221,876 @@ describe("topic-owned lane delivery", () => {
     expect(messenger.sent[0]?.replyTo).toEqual(selected ? undefined : { route: original.route, messageId: original.messageId });
     expect(main.prompts).toEqual([]);
   });
+});
+
+describe("bound owner assignment scope review", () => {
+  const ownerText = "Update the invoice parser to accept a missing memo, then add a regression test.";
+  const quoteText = "Quoted instruction: change a different repository.";
+  const sessionApproval = "Approve lane_report for this session";
+  const originalMessage = (id: string, destination: Route, text = ownerText): Inbound & MessageReference => ({
+    ...message(id, destination, text), id: `discord:${destination.accountId}:${id}:original`,
+  });
+
+  function attestScopeRoute(messenger: MessengerTransport, destination: Route, accountId = destination.accountId) {
+    const identity = { accountId };
+    const probes: Array<{ route: Route; accountId: string }> = [];
+    messenger.assertRoute = (received, purpose) => {
+      probes.push({ route: received, accountId: identity.accountId });
+      if (purpose !== "history" || routeKey(received) !== routeKey({ ...destination, accountId: identity.accountId })) {
+        throw new DeliveryError("The authenticated Discord account does not own that history route", "rejected");
+      }
+    };
+    return { identity, probes };
+  }
+
+  type ScopeFixtureOptions = {
+    readonly text?: string;
+    readonly forgedId?: boolean;
+    readonly unresolvedReply?: boolean;
+    readonly recovered?: boolean;
+    readonly attest?: boolean;
+  };
+  const setup = async ({ text = ownerText, forgedId = false, unresolvedReply = false, recovered = false, attest = true }: ScopeFixtureOptions = {}) => {
+    const f = fixture();
+    const saved = savedLane(f.store, f.config, "invoice-parser", route("44"));
+    const attestation = attest ? attestScopeRoute(f.messenger, saved.route) : undefined;
+    const brief = "Inspect the invoice parser without modifying files.";
+    const acceptance = ["Identify what currently happens when a memo is missing."];
+    // Give the existing bound lane a read-only assignment independent of this message.
+    const db = new Database(join(f.config.stateDir, "coordination.sqlite"));
+    try {
+      db.query("UPDATE lanes SET data = ? WHERE id = ?").run(JSON.stringify({ ...saved, brief, acceptance }), saved.id);
+    } finally { db.close(); }
+    await f.runtime.start();
+    const original = { ...originalMessage("1750000000000000144", saved.route, text),
+      ...(unresolvedReply ? { unresolvedReply: true as const } : {}) };
+    if (forgedId) original.id = `discord:${saved.route.accountId}:1750000000000000999:original`;
+    if (!unresolvedReply) original.reply = { messageId: "1750000000000000143", authorId: "7", text: quoteText, quote: quoteText };
+    if (recovered) {
+      const newer = originalMessage("1750000000000000145", saved.route, "Keep the existing read-only assignment.");
+      await admit(f.runtime, newer);
+      const resident = f.hosts.get(saved.socketPath);
+      if (!resident) throw new Error("Newer owner input did not reach its native lane");
+      const newerAnswer = f.messenger.whenSent(1);
+      resident.complete("The parser remains unchanged.");
+      await expectEvent(newerAnswer, "settled answer for the physically newer Discord owner message");
+      expect(f.store.input(`handoff:${newer.id}:${saved.id}`)?.state).toBe("done");
+      f.messenger.backlog.set(routeKey(saved.route), [newer, original]);
+      await f.runtime.catchup([{ route: saved.route, cursor: "1750000000000000143" }]);
+      await f.runtime.routingSettled();
+      await f.runtime.kick();
+    } else {
+      await admit(f.runtime, original);
+    }
+    const worker = f.hosts.get(saved.socketPath);
+    if (!worker) throw new Error("Bound owner input did not reach its native lane");
+    const handoffId = `handoff:${original.id}:${saved.id}`;
+    const reviewId = `scope-review:${handoffId}`;
+    return { ...f, lane: saved, worker, original, brief, acceptance, handoffId, reviewId, attestation };
+  };
+
+  function scopeReviewCall(worker: HostTransport, sourceId: string, nativeApproval?: "approved") {
+    const toolName = "lane_report";
+    const toolCallId = `native-scope-review-${worker.prompts.length}`;
+    return {
+      start: { type: "tool_execution_start", toolName, toolCallId, args: { status: "scope_review", sourceId } },
+      end: { type: "tool_execution_end", toolName, toolCallId, isError: false, result: { details: {
+        type: "superagent-scope-review", sourceId, sessionId: worker.state.sessionId,
+        sessionFile: worker.state.sessionFile, toolCallId, ...(nativeApproval === undefined ? {} : { nativeApproval }),
+      } } },
+    };
+  }
+
+  async function expectEvent(event: Promise<void>, label: string): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([event, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Missing ${label}`)), 1000);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+
+  function requestScopeReview(worker: HostTransport, sourceId: string): void {
+    const call = scopeReviewCall(worker, sourceId);
+    worker.emit(call.start);
+    worker.emit(call.end);
+  }
+
+  async function drainFrames(runtime: Superagent): Promise<void> {
+    // Finish frame-driven microtasks before inspecting the absence of a dispatch.
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    await runtime.kick();
+  }
+
+  async function setupCorrectiveRun() {
+    const fixture = await setup();
+    const { runtime, store, lane, original, worker, main, reviewId } = fixture;
+    const reviewReady = main.whenPrompts(1);
+    requestScopeReview(worker, original.id);
+    worker.complete("");
+    await expectEvent(reviewReady, "HEAD review of the original assignment");
+    const { inputId: correctionId } = await runtime.messageLane(lane.id, ownerText, reviewId);
+    const correctionReady = worker.whenPrompts(2);
+    main.complete("");
+    await expectEvent(correctionReady, "native corrective assignment");
+    await drainFrames(runtime);
+    const request = worker.prompts[1];
+    const current = store.lane(lane.id);
+    if (!request || !current) throw new Error("Corrective run has no native request or registered lane");
+    expect(current).toMatchObject({ sessionId: worker.state.sessionId, sessionFile: worker.state.sessionFile });
+    expect(store.input(correctionId)).toMatchObject({ state: "submitted", requestId: request.id, generation: current.generation });
+    worker.emitUiCancelOnResponse = false;
+    return { ...fixture, correctionId };
+  }
+
+  const correctiveSelect = {
+    type: "extension_ui_request", method: "select", id: "corrective-native-select",
+    title: "Allow tool: lane_report", options: ["Approve", sessionApproval, "Deny"],
+  } as const;
+
+  function finishNative(host: HostTransport, status: "aborted" | "error"): void {
+    const prompt = host.prompts.at(-1);
+    if (!prompt) throw new Error("No native admission to settle");
+    host.state.isStreaming = false;
+    host.state.isSettled = true;
+    host.emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: status } });
+    host.emit({ type: "prompt_result", id: prompt.id, agentInvoked: true, status, sessionSettled: true });
+    host.emit({ type: "session_settled" });
+  }
+
+  test("baseline: a dependency wait about the saved read-only brief stays in the bound lane, never reaching HEAD", async () => {
+    const { runtime, store, lane, worker, main, messenger, original, brief, acceptance, handoffId } = await setup({ attest: false });
+    expect(worker.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(ownerText)]);
+    expect(worker.prompts[0]?.command.message).toContain(brief);
+    expect(worker.prompts[0]?.command.message).toContain(acceptance[0]);
+    const report: LaneReport = {
+      status: "waiting", summary: "The existing assignment only permits inspection.",
+      waiting: { kind: "dependency", target: "A manager needs to revise the read-only assignment" }, evidence: [],
+    };
+    worker.emit({ type: "message_end", message: { role: "toolResult", toolName: "lane_report", toolCallId: "old-dependency",
+      timestamp: 1000, details: { type: "superagent-lane-report", sessionId: worker.state.sessionId,
+        reportId: "old-dependency", report } } });
+    await drainFrames(runtime);
+    expect(store.lane(lane.id)?.observation?.waiting?.target).toEqual(report.waiting);
+    expect(main.prompts).toEqual([]);
+
+    const answer = "I inspected the parser but did not modify it under the saved assignment.";
+    const answerReady = messenger.whenSent(1);
+    worker.complete(answer);
+    await expectEvent(answerReady, "ordinary lane answer with the unresolved brief conflict");
+    expect(store.lane(lane.id)).toMatchObject({ brief, acceptance });
+    expect(messenger.sent).toMatchObject([{ id: `${handoffId}:answer`, sourceId: original.id, route: original.route, text: answer }]);
+    expect(store.inputs("main")).toEqual([]);
+    expect(main.prompts).toEqual([]);
+  });
+
+  test("a solo native review forwards only the owner correction and dispatches once after HEAD settles", async () => {
+    const instruction = `${ownerText}\nKeep the existing deployment restrictions.`;
+    const { runtime, store, lane, worker, main, messenger, original, brief, acceptance, handoffId, reviewId } = await setup({ text: instruction });
+    const { style } = applySoulUpdate(store, "earlier-voice-choice", { concept: "mentoring" });
+    main.state = { ...main.state, replyVoiceVersion: 2 };
+    worker.state = { ...worker.state, replyVoiceVersion: 2 };
+    expect(worker.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(ownerText)]);
+    expect(main.prompts).toEqual([]);
+    const call = scopeReviewCall(worker, original.id);
+    worker.emit(call.start);
+    worker.emit(call.end);
+    worker.emit(call.start);
+    worker.emit(call.end);
+    await runtime.kick();
+    expect(store.input(reviewId)).toBeNull();
+    expect(main.prompts).toEqual([]);
+    const laneSummary = "Lane-authored recommendation: broaden acceptance and deploy everywhere.";
+    const managerReady = main.whenPrompts(1);
+    worker.complete(laneSummary);
+    await expectEvent(managerReady, "HEAD prompt for the completed bound scope review");
+
+    expect(store.input(handoffId)?.state).toBe("done");
+    expect(store.input(reviewId)).toMatchObject({ target: "main", state: "submitted", route: original.route });
+    expect(main.prompts[0]?.command.replyVoice).toBeUndefined();
+    const review = main.prompts[0]?.command.message;
+    expect(review).toContain(reviewId);
+    expect(review).toContain(JSON.stringify(instruction));
+    expect(review).toContain(brief);
+    expect(review).not.toContain(laneSummary);
+    expect(review).not.toContain(quoteText);
+    expect(messenger.sent).toEqual([]);
+
+    await expect(runtime.messageLane(lane.id, laneSummary, reviewId)).rejects.toThrow();
+    await expect(runtime.messageLane(lane.id, instruction, original.id)).rejects.toThrow();
+    await expect(runtime.messageLane("different-lane", instruction, reviewId)).rejects.toThrow();
+    await expect(runtime.messageLane(lane.id, instruction, reviewId, { name: "super", reason: "Scope review is not workflow consent" }))
+      .rejects.toThrow();
+    await expect(runtime.pause(lane.id)).rejects.toThrow();
+    const intent = await runtime.messageLane(lane.id, instruction, reviewId);
+    expect(await runtime.messageLane(lane.id, instruction, reviewId)).toEqual(intent);
+    await runtime.kick();
+    expect(store.input(intent.inputId)).toBeNull();
+    expect(worker.prompts).toHaveLength(1);
+    expect(messenger.sent).toEqual([]);
+
+    const correctionReady = worker.whenPrompts(2);
+    main.complete("HEAD internal acknowledgement");
+    await expectEvent(correctionReady, "same-lane corrective assignment after successful HEAD completion");
+    expect(store.input(reviewId)?.state).toBe("done");
+    expect(intent.inputId).toBe(`handoff:${reviewId}:${lane.id}`);
+    expect(store.input(intent.inputId)).toMatchObject({
+      target: lane.id, state: "submitted", route: original.route, text: instruction, workflow: null,
+    });
+    expect(worker.prompts[1]?.command.message).toContain(JSON.stringify(instruction));
+    expect(worker.prompts[1]?.command.message).not.toContain(laneSummary);
+    expect(worker.prompts[1]?.command.message).not.toContain(quoteText);
+    expect(worker.prompts[1]?.command.streamingBehavior).toBeUndefined();
+    expect(worker.prompts[1]?.command.replyVoice).toEqual(style);
+
+    const reply = "The parser now accepts missing memos and the regression test passes.";
+    const answerReady = messenger.whenSent(1);
+    worker.complete(reply);
+    await expectEvent(answerReady, "direct corrective result on the original thread");
+    await admit(runtime, original);
+    worker.emit(call.end);
+    await runtime.kick();
+    await expect(runtime.messageLane(lane.id, instruction, reviewId)).rejects.toThrow();
+    expect(main.prompts).toHaveLength(1);
+    expect(worker.prompts).toHaveLength(2);
+    expect(store.laneForRoute(original.route)).toMatchObject({ id: lane.id, brief, acceptance });
+    expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route,
+      replyTo: { route: original.route, messageId: original.messageId }, text: reply }]);
+    expect(messenger.threads).toEqual([]);
+  });
+
+  test.each(["matched", "dialog before tool start", "session choice", "unrelated", "denied", "cancelled",
+    "second dialog", "missing execute proof"] as const)(
+    "keeps the original native approval gate for a %s scope review signal", async scenario => {
+      const { runtime, store, lane, worker, main, messenger, original, handoffId, reviewId } = await setup();
+      // Stock RPC removes an answered select from get_state; cancel frames are
+      // also possible on abort and are not the normal response acknowledgment.
+      worker.emitUiCancelOnResponse = false;
+      const frame = {
+        type: "extension_ui_request", method: "select", id: "native-tool-approval",
+        title: scenario === "unrelated" ? "Proceed with the review?" : "Allow tool: lane_report",
+        options: scenario === "unrelated" ? ["Proceed", "Stop"]
+          : scenario === "dialog before tool start" || scenario === "session choice" ? ["Approve", sessionApproval, "Deny"]
+            : ["Approve", "Deny"],
+      };
+      const call = scopeReviewCall(worker, original.id, scenario === "missing execute proof" || scenario === "denied" ? undefined : "approved");
+      const startAfterDialog = scenario === "dialog before tool start";
+      if (!startAfterDialog) worker.emit(call.start);
+      worker.state.pendingUiRequests = [frame];
+      worker.emit(frame);
+      await expectEvent(messenger.whenApproval(), "original-route native select");
+      const card = [...messenger.shown.values()].find(approval => approval.requestId === frame.id);
+      if (!card || !messenger.handlers) throw new Error("Native approval was not delivered");
+      expect(card).toMatchObject({ target: lane.id, request: frame, route: original.route });
+      await expect(messenger.handlers.answer(card.id, { value: "Approve" }, route("45"))).rejects.toThrow();
+      expect(worker.responses).toEqual([]);
+      if (scenario === "cancelled") {
+        worker.state.pendingUiRequests = [];
+        worker.emit({ type: "extension_ui_request", method: "cancel", targetId: frame.id });
+        await drainFrames(runtime);
+        await expect(messenger.handlers.answer(card.id, { value: "Approve" }, original.route)).rejects.toThrow();
+        expect(worker.responses).toEqual([]);
+      } else {
+        const decision = { value: scenario === "unrelated" ? "Proceed" : scenario === "denied" ? "Deny"
+          : scenario === "session choice" ? sessionApproval : "Approve" };
+        await messenger.handlers.answer(card.id, decision, original.route);
+        expect(worker.responses).toEqual([{ id: frame.id, response: decision }]);
+      }
+      if (startAfterDialog) worker.emit(call.start);
+
+      if (scenario === "second dialog") {
+        const extra = { ...frame, id: "second-native-approval" };
+        worker.state.pendingUiRequests = [extra];
+        worker.emit(extra);
+        await drainFrames(runtime);
+        const other = [...messenger.shown.values()].find(approval => approval.requestId === extra.id);
+        if (!other) throw new Error("Second native approval was not delivered");
+        await messenger.handlers.answer(other.id, { value: "Approve" }, original.route);
+      }
+
+      worker.emit(scenario === "denied" ? { ...call.end, isError: true } : call.end);
+      const accepted = scenario === "matched" || scenario === "session choice" || startAfterDialog;
+      const laneAnswer = "The existing assignment still permits only inspection.";
+      const disposition = accepted ? main.whenPrompts(1) : messenger.whenSent(1);
+      worker.complete(laneAnswer);
+      await expectEvent(disposition, accepted ? "HEAD review after verified approval" : "direct lane answer without review authority");
+      if (accepted) {
+        expect(messenger.sent).toEqual([]);
+        expect(store.input(reviewId)?.state).toBe("submitted");
+        const correction = await runtime.messageLane(lane.id, ownerText, reviewId);
+        const correctionReady = worker.whenPrompts(2);
+        main.complete("");
+        await expectEvent(correctionReady, "corrective assignment after the approved signal and HEAD settlement");
+        expect(store.input(correction.inputId)?.state).toBe("submitted");
+        if (scenario === "session choice") {
+          const corrected = messenger.whenSent(1);
+          worker.complete("The invoice parser now accepts a missing memo.");
+          await expectEvent(corrected, "approved correction settling before later owner input");
+
+          const later = originalMessage("1750000000000000145", original.route, "Also update the parser to trim invoice memos.");
+          const laterInput = `handoff:${later.id}:${lane.id}`;
+          await admit(runtime, later);
+          expect(store.input(laterInput)).toMatchObject({ requestId: worker.prompts[2]?.id, state: "submitted" });
+          // A later receipt claiming approval does not prove an exact approval callback.
+          const laterCall = scopeReviewCall(worker, later.id, "approved");
+          worker.emit(laterCall.start);
+          worker.emit(laterCall.end);
+          const directReply = messenger.whenSent(2);
+          const reply = "The saved assignment does not currently permit trimming memos.";
+          worker.complete(reply);
+          await expectEvent(directReply, "direct answer when the later approval receipt has no matching card");
+          expect(store.input(`scope-review:${laterInput}`)).toBeNull();
+          expect(main.prompts).toHaveLength(1);
+          expect(worker.responses).toEqual([{ id: frame.id, response: { value: sessionApproval } }]);
+          expect(messenger.sent[1]).toMatchObject({ id: `${laterInput}:answer`, sourceId: later.id, text: reply });
+        }
+      } else {
+        await drainFrames(runtime);
+        expect(store.input(reviewId)).toBeNull();
+        expect(main.prompts).toEqual([]);
+        expect(worker.prompts).toHaveLength(1);
+        expect(messenger.sent).toMatchObject([{ id: `${handoffId}:answer`, sourceId: original.id, route: original.route, text: laneAnswer }]);
+      }
+    },
+  );
+
+  test("commentary sharing a native message with a scope review call never escapes as an extra reply", async () => {
+    const { runtime, store, lane, worker, main, messenger, original, reviewId } = await setup();
+    const call = scopeReviewCall(worker, original.id);
+    worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [
+      { type: "text", text: "Checking whether the assignment has changed.",
+        textSignature: JSON.stringify({ v: 1, id: "scope-commentary", phase: "commentary" }) },
+      { type: "toolCall", id: call.start.toolCallId, name: call.start.toolName, arguments: call.start.args },
+    ] } });
+    // Stock RPC publishes the assistant message before the execution events.
+    // Drain the outbox now so later promotion cannot hide a leaked send.
+    await drainFrames(runtime);
+    expect(messenger.attempted).toEqual([]);
+    expect(store.input(reviewId)).toBeNull();
+
+    const reviewReady = main.whenPrompts(1);
+    worker.emit(call.start);
+    worker.emit(call.end);
+    worker.complete("");
+    await expectEvent(reviewReady, "HEAD review after the native scope signal");
+    const reviewAnswer = messenger.whenSent(1);
+    const clarification = "Should the lane now make changes rather than only inspect the parser?";
+    main.complete(clarification);
+    await expectEvent(reviewAnswer, "single original-thread response to the scope review");
+
+    const later = originalMessage("1750000000000000145", original.route, "Explain the existing memo checks without editing.");
+    await admit(runtime, later);
+    const laterInput = `handoff:${later.id}:${lane.id}`;
+    expect(store.input(laterInput)).toMatchObject({ state: "submitted", requestId: worker.prompts[1]?.id });
+    const progressReady = messenger.whenSent(2);
+    const progress = "I am checking the existing memo validation.";
+    worker.emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [
+      { type: "text", text: progress,
+        textSignature: JSON.stringify({ v: 1, id: "regular-commentary", phase: "commentary" }) },
+    ] } });
+    await expectEvent(progressReady, "ordinary topic commentary before native settlement");
+    const replyReady = messenger.whenSent(3);
+    const reply = "The parser currently requires a nonempty memo.";
+    worker.complete(reply);
+    await expectEvent(replyReady, "ordinary topic answer");
+    await drainFrames(runtime);
+    expect(messenger.sent).toMatchObject([
+      { sourceId: original.id, route: original.route, text: clarification },
+      { sourceId: later.id, route: later.route, text: progress },
+      { id: `${laterInput}:answer`, sourceId: later.id, route: later.route, text: reply },
+    ]);
+    expect(main.prompts).toHaveLength(1);
+  });
+
+  test.each(["no report", "receipt without start", "message result only", "old native session", "native tool refusal",
+    "other thread owner", "internal handoff", "forged original id", "inline quote", "unresolved reply"] as const)(
+    "keeps the direct lane reply for %s rather than reviewing scope", async scenario => {
+      const text = scenario === "inline quote" ? `${ownerText}\n> ${quoteText}` : ownerText;
+      const { runtime, config, store, original, lane, worker, main, messenger, handoffId, reviewId } =
+        await setup({ text, forgedId: scenario === "forged original id", unresolvedReply: scenario === "unresolved reply" });
+      let sourceId = scenario === "internal handoff" ? handoffId : original.id;
+      if (scenario === "other thread owner") {
+        const foreign = savedLane(store, config, "other-invoice", route("45"));
+        const other = originalMessage("1750000000000000145", foreign.route);
+        await admit(runtime, other);
+        expect(store.input(`handoff:${other.id}:${foreign.id}`)?.state).toBe("submitted");
+        sourceId = other.id;
+      }
+      const call = scopeReviewCall(worker, sourceId);
+      switch (scenario) {
+        case "no report": break;
+        case "receipt without start": worker.emit(call.end); break;
+        case "message result only":
+          worker.emit({ type: "message_end", message: { role: "toolResult", toolName: call.end.toolName,
+            toolCallId: call.end.toolCallId, isError: false, details: call.end.result.details } });
+          break;
+        case "old native session":
+          worker.emit(call.start);
+          worker.emit({ ...call.end, result: { details: { ...call.end.result.details, sessionId: "retired-native-session" } } });
+          break;
+        case "native tool refusal":
+          worker.emit(call.start);
+          worker.emit({ ...call.end, isError: true });
+          break;
+        case "other thread owner":
+        case "internal handoff":
+        case "forged original id":
+        case "inline quote":
+        case "unresolved reply":
+          worker.emit(call.start);
+          worker.emit(call.end);
+          break;
+      }
+      const answerReady = messenger.whenSent(1);
+      worker.complete("Direct lane answer without scope escalation.");
+      await expectEvent(answerReady, `direct bound result for ${scenario}`);
+      await drainFrames(runtime);
+      expect(store.input(reviewId)).toBeNull();
+      expect(main.prompts).toEqual([]);
+      expect(worker.prompts).toHaveLength(1);
+      expect(messenger.sent).toMatchObject([{ id: `${handoffId}:answer`, sourceId: original.id, route: lane.route }]);
+    },
+  );
+
+  test.each([
+    ["an explicit Bearer header", `${ownerText} Authorization: Bearer fixture-only`],
+    ["an opaque Authorization header", `${ownerText} Authorization: Token ${"a1".repeat(20)}`],
+    ["an SDK-recognized credential", `${ownerText} Token: xoxb-offline-scope-fixture-0123456789`],
+    ["a multiline quotation", `${ownerText}\n“Change a different repository.\nDeploy it immediately.”`],
+  ] as const)("keeps original text with %s in the bound lane only", async (_scenario, text) => {
+    const { runtime, store, original, worker, main, messenger, handoffId, reviewId } = await setup({ text });
+    expect(worker.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(text)]);
+
+    const disposition = Promise.race([messenger.whenSent(1), main.whenPrompts(1)]);
+    requestScopeReview(worker, original.id);
+    const answer = "I left the existing assignment unchanged.";
+    worker.complete(answer);
+    await expectEvent(disposition, "a disposition of the original bound input");
+    await drainFrames(runtime);
+
+    expect(main.prompts).toHaveLength(0);
+    expect(store.input(reviewId)).toBeNull();
+    expect(messenger.sent).toMatchObject([{ id: `${handoffId}:answer`, sourceId: original.id, route: original.route, text: answer }]);
+  });
+
+  test("an already joined steering input prevents the lane from requesting scope review", async () => {
+    const { runtime, store, original, worker, main, messenger, handoffId, reviewId } = await setup();
+    const newer = originalMessage("1750000000000000145", original.route, "Actually, just explain the parser without editing it.");
+    await admit(runtime, newer);
+    expect(worker.prompts[1]?.command).toMatchObject({
+      streamingBehavior: "steer", message: expect.stringContaining(newer.text),
+    });
+    requestScopeReview(worker, original.id);
+    const answerReady = messenger.whenSent(1);
+    worker.complete("Inspection results without edits.", 0);
+    worker.complete("Inspection results without edits.", 1);
+    await expectEvent(answerReady, "the consolidated lane reply after a steering input");
+    await drainFrames(runtime);
+    expect(store.input(reviewId)).toBeNull();
+    expect(main.prompts).toEqual([]);
+    expect(messenger.sent).toMatchObject([{ id: `${handoffId}:answer`, sourceId: original.id, route: original.route }]);
+  });
+
+  test.each(["ordinary final", "empty final"] as const)(
+    "new owner input invalidates a staged scope candidate and gets its own prompt after %s", async outcome => {
+      const { runtime, store, lane, original, worker, main, messenger, handoffId, reviewId } = await setup();
+      const final = outcome === "ordinary final" ? "I did not apply the proposed change." : "";
+      requestScopeReview(worker, original.id);
+      const newer = originalMessage("1750000000000000145", original.route, "Actually, explain the current parser without edits.");
+      const newerId = `handoff:${newer.id}:${lane.id}`;
+      await admit(runtime, newer);
+      expect(store.input(newerId)?.state).toBe("pending");
+      expect(worker.prompts).toHaveLength(1);
+
+      const nextPrompt = worker.whenPrompts(2);
+      worker.complete(final);
+      await expectEvent(nextPrompt, "normal lane prompt for the superseding owner input");
+      const nextRequestId = store.input(newerId)?.requestId;
+      if (!nextRequestId) throw new Error("The superseding owner input has no native prompt receipt");
+      expect(worker.prompts[1]?.id).toBe(nextRequestId);
+      expect(worker.prompts[1]?.command.message).toContain(newer.text);
+      expect(worker.prompts[1]?.command.streamingBehavior).toBeUndefined();
+      const bothAnswers = messenger.whenSent(2);
+      worker.complete("The parser currently requires a memo.");
+      await expectEvent(bothAnswers, "a disposition for the stale candidate and a reply to the newer owner");
+      await drainFrames(runtime);
+      expect(store.input(reviewId)).toBeNull();
+      expect(main.prompts).toEqual([]);
+      expect(messenger.sent.map(({ id, sourceId, route, replyTo }) => ({ id, sourceId, route, replyTo }))).toEqual([
+        { id: `${handoffId}:answer`, sourceId: original.id, route: original.route,
+          replyTo: { route: original.route, messageId: original.messageId } },
+        { id: `${newerId}:answer`, sourceId: newer.id, route: newer.route,
+          replyTo: { route: newer.route, messageId: newer.messageId } },
+      ]);
+      const [disposition, newerReply] = messenger.sent;
+      if (!disposition || !newerReply) throw new Error("Both original-thread dispositions are required");
+      expect(newerReply.text).toBe("The parser currently requires a memo.");
+      if (final) expect(disposition.text).toBe(final);
+      else {
+        expect(disposition.text).toMatch(/scope.*not authorized/i);
+        expect(disposition.text.length).toBeLessThanOrEqual(1200);
+        expect(disposition.text).not.toContain(ownerText);
+      }
+    },
+  );
+
+  test("history recovery of an older Discord original never regrants scope after a newer physical message settled", async () => {
+    const { runtime, store, lane, original, worker, main, messenger, handoffId, reviewId } = await setup({ recovered: true });
+    expect(messenger.fetched).toEqual([{ route: original.route, cursor: "1750000000000000143" }]);
+    expect(worker.prompts).toHaveLength(2);
+    expect(worker.prompts[1]?.command.message).toContain(ownerText);
+    expect(store.input(handoffId)?.state).toBe("submitted");
+
+    requestScopeReview(worker, original.id);
+    const reply = "I left the current assignment unchanged.";
+    const delivered = messenger.whenSent(2);
+    worker.complete(reply);
+    await expectEvent(delivered, "ordinary reply to the recovered older original");
+    await drainFrames(runtime);
+    expect(main.prompts).toEqual([]);
+    expect(store.input(reviewId)).toBeNull();
+    expect(store.input(`handoff:${reviewId}:${lane.id}`)).toBeNull();
+    expect(messenger.sent).toMatchObject([
+      { sourceId: `discord:${original.route.accountId}:1750000000000000145:original`, route: original.route },
+      { id: `${handoffId}:answer`, sourceId: original.id, route: original.route,
+        replyTo: { route: original.route, messageId: original.messageId }, text: reply },
+    ]);
+  });
+
+  test.each(["paused", "cancelled", "uncertain"] as const)("does not promote a candidate when the original lane is %s", async status => {
+    const { runtime, store, lane, original, worker, main, handoffId, reviewId } = await setup();
+    requestScopeReview(worker, original.id);
+    if (status === "paused") {
+      await runtime.pause(lane.id);
+      expect(store.lane(lane.id)?.workState).toBe("paused");
+      worker.complete("A late native completion cannot certify stopped work.");
+    } else {
+      finishNative(worker, status === "cancelled" ? "aborted" : "error");
+    }
+    await drainFrames(runtime);
+    expect(store.input(handoffId)?.state).toBe(status === "uncertain" ? "uncertain" : "cancelled");
+    expect(store.input(reviewId)).toBeNull();
+    expect(worker.prompts).toHaveLength(1);
+    expect(main.prompts.some(prompt => typeof prompt.command.message === "string" && prompt.command.message.includes(reviewId))).toBe(false);
+  });
+
+  test.each(["rejects", "is cancelled", "is uncertain", "runs a second native turn", "has a paused goal"] as const)(
+    "never dispatches a correction when HEAD %s", async scenario => {
+      const { runtime, store, lane, original, worker, main, messenger, reviewId } = await setup();
+      const managerReady = main.whenPrompts(1);
+      requestScopeReview(worker, original.id);
+      worker.complete("Requesting review of the conflicting brief.");
+      await expectEvent(managerReady, "HEAD review");
+
+      const correctionId = `handoff:${reviewId}:${lane.id}`;
+      const rejection = "Please confirm whether this follow-up supersedes the saved read-only assignment.";
+      const answerReady = messenger.whenSent(1);
+      if (scenario === "rejects") {
+        main.complete(rejection);
+      } else {
+        await runtime.messageLane(lane.id, ownerText, reviewId);
+        if (scenario === "is cancelled" || scenario === "is uncertain") {
+          finishNative(main, scenario === "is cancelled" ? "aborted" : "error");
+        } else if (scenario === "runs a second native turn") {
+          main.emit({ type: "agent_start" });
+          main.complete("A joined native turn cannot authorize a correction.");
+        } else {
+          main.state.goal = { mode: "active", enabled: false,
+            goal: { id: "paused-head-goal", status: "paused" } };
+          main.complete("A paused goal cannot certify a solo review.");
+        }
+      }
+      await expectEvent(answerReady, "one non-authorizing original-thread scope review result");
+      await drainFrames(runtime);
+      expect(store.input(reviewId)?.state).toBe(scenario === "is cancelled" ? "cancelled" : scenario === "is uncertain" ? "uncertain" : "done");
+      expect(store.input(correctionId)).toBeNull();
+      expect(worker.prompts).toHaveLength(1);
+      expect(messenger.sent).toMatchObject([{ sourceId: original.id, route: original.route,
+        replyTo: { route: original.route, messageId: original.messageId },
+        ...(scenario === "rejects" ? { text: rejection } : {}) }]);
+    },
+  );
+
+  test.each(["original run", "corrective assignment"] as const)("keeps the original route and native approval guard during the %s", async stage => {
+    const { runtime, store, lane, original, worker, main, messenger, handoffId, reviewId } = await setup();
+    requestScopeReview(worker, original.id);
+    const corrected = stage === "corrective assignment";
+    let finalInputId = handoffId;
+    if (corrected) {
+      const managerReady = main.whenPrompts(1);
+      worker.complete("Review whether the existing assignment was superseded.");
+      await expectEvent(managerReady, "HEAD review");
+      finalInputId = (await runtime.messageLane(lane.id, ownerText, reviewId)).inputId;
+      const correctionReady = worker.whenPrompts(2);
+      main.complete("");
+      await expectEvent(correctionReady, "corrective lane prompt");
+    }
+    const frame = { type: "extension_ui_request", method: "confirm", id: "native-invoice-confirm", title: "Apply the proposed parser changes?" };
+    const approvalReady = messenger.whenApproval();
+    worker.state.pendingUiRequests = [frame];
+    worker.emit(frame);
+    await expectEvent(approvalReady, `${stage} native card`);
+    const [card] = [...messenger.shown.values()];
+    if (!card || !messenger.handlers) throw new Error("No original-route native approval was delivered");
+    expect(card).toMatchObject({ target: lane.id, route: original.route, request: frame });
+    expect(worker.responses).toEqual([]);
+    expect(messenger.sent).toEqual([]);
+    await expect(messenger.handlers.answer(card.id, { confirmed: true }, route("45"))).rejects.toThrow();
+    expect(worker.responses).toEqual([]);
+    const decision = { confirmed: corrected };
+    await messenger.handlers.answer(card.id, decision, original.route);
+    expect(worker.responses).toEqual([{ id: frame.id, response: decision }]);
+
+    const reply = corrected ? "Owner confirmed the parser change." : "Owner denied the parser change.";
+    const answerReady = messenger.whenSent(1);
+    worker.complete(reply);
+    await expectEvent(answerReady, "single final answer after the owner handles the native approval");
+    await drainFrames(runtime);
+    expect(store.input(finalInputId)?.state).toBe("done");
+    expect(store.input(reviewId)?.state ?? null).toBe(corrected ? "done" : null);
+    expect(main.prompts).toHaveLength(corrected ? 1 : 0);
+    expect(worker.prompts).toHaveLength(corrected ? 2 : 1);
+    expect(messenger.sent).toMatchObject([{ id: `${finalInputId}:answer`, sourceId: original.id, route: original.route, text: reply }]);
+  });
+
+  test("an already-presented corrective select forwards the exact owner Deny once after supersession", async () => {
+    const { runtime, store, lane, worker, messenger, original, reviewId } = await setupCorrectiveRun();
+    const approvalReady = messenger.whenApproval();
+    worker.state.pendingUiRequests = [correctiveSelect];
+    worker.emit(correctiveSelect);
+    await expectEvent(approvalReady, "original-route corrective select");
+    const [card] = [...messenger.shown.values()];
+    const handlers = messenger.handlers;
+    if (!card || !handlers) throw new Error("No corrective select was presented");
+    expect(card).toMatchObject({ target: lane.id, requestId: correctiveSelect.id, request: correctiveSelect, route: original.route });
+
+    const newer = originalMessage("1750000000000000145", original.route, "Leave the parser read-only.");
+    await admit(runtime, newer);
+    expect(store.scopeReview(reviewId)).toBeNull();
+    const denial = { value: "Deny" };
+    await expect(handlers.answer(card.id, denial, route("45"))).rejects.toMatchObject({ certainty: "rejected" });
+    expect(worker.responses).toEqual([]);
+    expect(worker.state.pendingUiRequests).toEqual([correctiveSelect]);
+
+    await handlers.answer(card.id, denial, original.route);
+    await expect(handlers.answer(card.id, denial, original.route)).rejects.toThrow();
+    await handlers.reconnect?.();
+    expect(worker.responses).toEqual([{ id: correctiveSelect.id, response: denial }]);
+    expect(worker.state.pendingUiRequests).toEqual([]);
+    expect(store.approval(card.id)?.state).toBe("answered");
+  });
+
+  test("lost acknowledgement of a stale corrective cancellation is not a new response on reconnect", async () => {
+    const { runtime, store, worker, messenger, original } = await setupCorrectiveRun();
+    const presentation = Promise.withResolvers<string>();
+    const show = messenger.showApproval.bind(messenger);
+    messenger.showApproval = async approval => {
+      await show(approval);
+      return presentation.promise;
+    };
+    const shown = messenger.whenApproval();
+    worker.state.pendingUiRequests = [correctiveSelect];
+    worker.emit(correctiveSelect);
+    await expectEvent(shown, "corrective card before supersession");
+    const [card] = messenger.shown.values();
+    if (!card || !messenger.handlers) throw new Error("Missing original corrective card");
+    await admit(runtime, originalMessage("1750000000000000145", original.route, "Keep the parser read-only."));
+    worker.uiAcknowledges = false;
+    await expect(messenger.handlers.answer(card.id, { value: "Approve" }, original.route))
+      .rejects.toMatchObject({ certainty: "uncertain" });
+    presentation.reject(new Error("Card presentation receipt lost after the callback"));
+    await drainFrames(runtime);
+    await messenger.handlers.reconnect?.();
+    worker.emit(correctiveSelect);
+    await drainFrames(runtime);
+    expect(store.approval(card.id)?.state).toBe("cancelled");
+    expect(worker.state.pendingUiRequests).toEqual([correctiveSelect]);
+    expect(worker.responses).toEqual([{ id: correctiveSelect.id, response: { cancelled: true } }]);
+  });
+
+  test.each(["exact", "ambiguous", "unbound"] as const)(
+    "a newly seen stale corrective dialog is cancelled only with exact native ownership (%s)", async ownership => {
+      const { runtime, store, lane, worker, hosts, messenger, original, correctionId, reviewId } = await setupCorrectiveRun();
+      const newer = originalMessage("1750000000000000145", original.route, "Leave the parser read-only.");
+      await admit(runtime, newer);
+      expect(store.scopeReview(reviewId)).toBeNull();
+      expect(store.input(correctionId)?.state).toBe("submitted");
+      expect(worker.prompts).toHaveLength(2);
+      expect(messenger.shown.size).toBe(0);
+
+      let native = worker;
+      if (ownership === "unbound") {
+        // Reattach to the actual lane session, but without a verified live
+        // admission after the original native connection was lost.
+        native = new HostTransport(lane.sessionFile, worker.state.sessionId);
+        native.state = structuredClone(worker.state);
+        const reattached = Promise.withResolvers<void>();
+        native.beforeState = () => reattached.resolve();
+        hosts.set(lane.socketPath, native);
+        await worker.close();
+        await expectEvent(reattached.promise, "native lane reconnection");
+        await drainFrames(runtime);
+        expect(store.input(correctionId)?.state).toBe("uncertain");
+        expect(native.prompts).toEqual([]);
+      } else if (ownership === "ambiguous") {
+        worker.emit({ type: "agent_start" });
+      }
+
+      native.emitUiCancelOnResponse = false;
+      native.state.pendingUiRequests = [correctiveSelect];
+      native.emit(correctiveSelect);
+      await drainFrames(runtime);
+      const cancelled = ownership === "exact";
+      expect(native.responses).toEqual(cancelled ? [{ id: correctiveSelect.id, response: { cancelled: true } }] : []);
+      expect(native.state.pendingUiRequests).toEqual(cancelled ? [] : [correctiveSelect]);
+      expect(messenger.shown.size).toBe(0);
+      expect(store.approvals(lane.id)).toEqual([]);
+    },
+  );
+
+  test.each(["exact", "unacknowledged", "unverified"] as const)("a stale scope review only cancels a HEAD dialog with %s native ownership", async ownership => {
+    const { runtime, store, original, worker, main, messenger, reviewId } = await setup();
+    const managerReady = main.whenPrompts(1);
+    requestScopeReview(worker, original.id);
+    worker.complete("");
+    await expectEvent(managerReady, "HEAD review while the original scope is still eligible");
+    const newer = originalMessage("1750000000000000145", original.route, "Leave the scope as read-only.");
+    await admit(runtime, newer);
+    expect(store.input(reviewId)?.state).toBe("submitted");
+    expect(store.scopeReview(reviewId)).toBeNull();
+
+    if (ownership === "unverified") main.emit({ type: "agent_start" });
+    if (ownership === "unacknowledged") main.uiAcknowledges = false;
+    const frame = { type: "extension_ui_request", method: "confirm", id: "stale-head-confirm", title: "Apply this correction?" };
+    main.state.pendingUiRequests = [frame];
+    main.emit(frame);
+    await drainFrames(runtime);
+    if (ownership === "unacknowledged") {
+      finishNative(main, "error");
+      await messenger.handlers?.reconnect?.();
+      main.emit(frame);
+      await drainFrames(runtime);
+    }
+    expect(main.responses).toEqual(ownership !== "unverified" ? [{ id: frame.id, response: { cancelled: true } }] : []);
+    expect(main.state.pendingUiRequests).toEqual(ownership === "exact" ? [] : [frame]);
+    expect(messenger.shown.size).toBe(0);
+    expect(store.approvals("main")).toEqual([]);
+  });
+
+  test("missing route attestation withholds scope review without blocking ordinary bound input", async () => {
+    const { runtime, store, original, worker, main, messenger, handoffId, reviewId } = await setup({ attest: false });
+    expect(store.input(handoffId)?.state).toBe("submitted");
+    expect(worker.prompts[0]?.command.message).toContain(ownerText);
+
+    requestScopeReview(worker, original.id);
+    worker.complete("");
+    await drainFrames(runtime);
+    expect(store.input(reviewId)?.state).toBe("cancelled");
+    expect(main.prompts).toEqual([]);
+    expect(worker.prompts).toHaveLength(1);
+    expect(messenger.threads).toEqual([]);
+  });
+
+  test("an authenticated Discord account change after HEAD reviews keeps the correction from native dispatch", async () => {
+    const { runtime, store, lane, original, worker, main, attestation, reviewId } = await setup();
+    if (!attestation) throw new Error("Missing fixture account attestation");
+    const managerReady = main.whenPrompts(1);
+    requestScopeReview(worker, original.id);
+    worker.complete("");
+    await expectEvent(managerReady, "review under the original authenticated account");
+    const { inputId } = await runtime.messageLane(lane.id, ownerText, reviewId);
+    expect(store.input(inputId)).toBeNull();
+    attestation.identity.accountId = "900";
+
+    main.complete("");
+    await drainFrames(runtime);
+    expect(attestation.probes).toEqual([
+      { route: original.route, accountId: original.route.accountId },
+      { route: original.route, accountId: "900" },
+    ]);
+    expect(store.input(reviewId)?.state).toBe("done");
+    expect(store.input(inputId)?.state).toBe("cancelled");
+    expect(worker.prompts).toHaveLength(1);
+  });
+
+  test.each(["pending review", "pending review with a different authenticated account", "interrupted review after corrective intent"] as const)(
+    "restores only authorized work from a stored %s", async stage => {
+      const { runtime, config, directory, store, main, lane, worker, original, reviewId } = await setup();
+      const wasPending = stage !== "interrupted review after corrective intent";
+      const accountId = stage === "pending review with a different authenticated account" ? "900" : original.route.accountId;
+      if (wasPending) {
+        main.state.isStreaming = true;
+        main.state.isSettled = false;
+        main.emit({ type: "agent_start" });
+      }
+      const managerReady = wasPending ? undefined : main.whenPrompts(1);
+      requestScopeReview(worker, original.id);
+      worker.complete("Conflicting assignment needs review.");
+      if (managerReady) {
+        await expectEvent(managerReady, "original HEAD review");
+        await runtime.messageLane(lane.id, ownerText, reviewId);
+      }
+      await drainFrames(runtime);
+      const correctionId = `handoff:${reviewId}:${lane.id}`;
+      expect(store.input(reviewId)?.state).toBe(wasPending ? "pending" : "submitted");
+      expect(store.input(correctionId)).toBeNull();
+      expect(main.prompts).toHaveLength(wasPending ? 0 : 1);
+      await runtime.stop();
+
+      const reopened = new Store(join(directory, "coordination.sqlite"));
+      const messenger = new MessengerTransport();
+      const { probes } = attestScopeRoute(messenger, original.route, accountId);
+      const headPath = hostPaths(config, "main");
+      const head = new HostTransport(headPath.sessionFile, main.state.sessionId);
+      const resident = new HostTransport(lane.sessionFile, worker.state.sessionId);
+      if (!wasPending) head.state = structuredClone(main.state);
+      const restarted = new Superagent(config, reopened, messenger, join(directory, "extension.ts"), () => {}, {
+        connect: async path => {
+          if (path === headPath.socketPath) return head;
+          if (path === lane.socketPath) return resident;
+          throw new Error("Unexpected native owner during scope review recovery");
+        },
+      });
+      const tracked = fixtures.find(entry => entry.runtime === runtime);
+      if (!tracked) throw new Error("Missing scope review restart fixture");
+      tracked.runtime = restarted;
+      await restarted.start();
+      await admit(restarted, original);
+      if (!wasPending) {
+        await drainFrames(restarted);
+        expect(reopened.input(reviewId)?.state).toBe("uncertain");
+        expect(reopened.input(correctionId)).toBeNull();
+        expect(head.prompts).toEqual([]);
+        expect(resident.prompts).toEqual([]);
+        return;
+      }
+      if (accountId !== original.route.accountId) {
+        await drainFrames(restarted);
+        expect(probes).toEqual([{ route: original.route, accountId }]);
+        expect(reopened.input(reviewId)?.state).toBe("cancelled");
+        expect(reopened.input(correctionId)).toBeNull();
+        expect(head.prompts).toEqual([]);
+        expect(resident.prompts).toEqual([]);
+        return;
+      }
+      await expectEvent(head.whenPrompts(1), "pending HEAD review after controller reopens the ledger");
+      expect(head.prompts[0]?.command.message).toContain(ownerText);
+      await restarted.messageLane(lane.id, ownerText, reviewId);
+      expect(resident.prompts).toEqual([]);
+      const correctionReady = resident.whenPrompts(1);
+      head.complete("");
+      await expectEvent(correctionReady, "once-only correction after the restored review completes");
+      expect(reopened.input(correctionId)?.state).toBe("submitted");
+      const answerReady = messenger.whenSent(1);
+      const reply = "The missing memo is now covered.";
+      resident.complete(reply);
+      await expectEvent(answerReady, "original-thread answer after recovery");
+      await admit(restarted, original);
+      expect(head.prompts).toHaveLength(1);
+      expect(resident.prompts).toHaveLength(1);
+      expect(messenger.sent).toMatchObject([{ id: `${correctionId}:answer`, sourceId: original.id, route: original.route, text: reply }]);
+    },
+  );
 });
 
 describe("original-message processing reactions", () => {
@@ -4563,6 +6572,14 @@ function savedLane(store: Store, config: Config, id: string, destination: Route,
   }, source.id);
   store.settle(source.id, "done");
   return lane;
+}
+
+function markMockHostEndpoint(host: HostTransport, path: string): void {
+  // The fake connect adapter supplies the transport; its endpoint is observable
+  // to residency checks only until the mock Host disconnects at shutdown.
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "");
+  void host.exited.then(() => rmSync(path, { force: true }));
 }
 
 function legacyLane(store: Store, config: Config, id: string, destination: Route, pid: number | null = null): Lane {
@@ -5412,6 +7429,13 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(store.getMeta(`activity-source:report:${original.id}`)).toBe(source.id);
     expect(store.input(`report:${original.id}`)?.text).toContain(native.state.sessionId);
     expect(store.input(`report:${original.id}`)?.text).toContain(lane.sessionFile);
+    if (outcome === "error" && !window) {
+      // A historical owned run has a result to report but no independently
+      // authenticated owner request that could authorize a correction.
+      expect(main.prompts[0]?.command.message).toContain("Informational lane failure");
+      await expect(runtime.messageLane(lane.id, "Replay this old run", `report:${original.id}`)).rejects.toThrow();
+      expect(store.input(`handoff:report:${original.id}:${lane.id}`)).toBeNull();
+    }
     if (timing === "between-state-and-entries") {
       expect([...messenger.shown.values()]).toMatchObject([{ route: original.route, generation: lane.generation, requestId: "window-question" }]);
       expect(messenger.dismissed).toHaveLength(1);
@@ -5669,6 +7693,9 @@ describe("messenger head session controls", () => {
     }
     expect(main.prompts).toHaveLength(1);
     expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
+    const modelStatus = messenger.sent.find(output => output.sourceId === "head-query-0");
+    expect(modelStatus?.picker).toMatchObject({ kind: "model", modelTargets: {} });
+    expect(modelStatus?.text).not.toContain("HEAD session only");
     const replies = messenger.sent.map(output => output.text).join("\n");
     expect(replies).toContain("HEAD session only");
     expect(replies).toContain("fixture/capable");
@@ -5747,8 +7774,12 @@ describe("messenger head session controls", () => {
     expect(model.picker.groups).toEqual([{ label: "fixture", options: ["fixture/capable", "fixture/efficient"] }]);
     expect(effort.picker.groups).toEqual([{ label: "Effort", options: ["off", "auto", "minimal", "high"] }]);
     await admit(runtime, message("1004", destination, "/main"));
-    const modelSelection = pickerClick(model, 0, 1);
+    expect(model.picker).toMatchObject({ kind: "model", modelTargets: {} });
+    expect(model.picker).not.toHaveProperty("modelTargets.lane");
+    const modelSelection = pickerClick(model, 0, 1, { target: "head" });
     await expect(runtime.receive({ ...modelSelection, route: destination })).rejects.toThrow("original owner command and card");
+    await expect(runtime.receive(pickerClick(model, 0, 1, { target: "lane" }))).rejects.toThrow("original owner command and card");
+    expect(store.input(modelSelection.id)).toBeNull();
     await admit(runtime, modelSelection);
     await admit(runtime, modelSelection);
     expect(main.state.model).toEqual(otherModel);
@@ -5770,6 +7801,168 @@ describe("messenger head session controls", () => {
     expect(main.state).toMatchObject({ configuredThinkingLevel: "auto", thinkingLevel: "minimal" });
     expect(main.prompts).toEqual([]);
   });
+
+  test("a bound Discord model card requires an explicit destination and applies HEAD without touching the lane", async () => {
+    const { runtime, config, main, store, messenger, hosts, launched } = fixture();
+    const lane = savedLane(store, config, "picker-head-bound", route("picker-head-bound"), process.pid);
+    const worker = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, worker);
+    await runtime.start();
+    const open = applicationCommand("11010", lane.route, "/model");
+    await admit(runtime, open);
+    const card = messenger.sent.find(output => output.sourceId === open.id);
+    if (!card?.picker) throw new Error("Expected the bound Discord model menu");
+    expect(card).toMatchObject({ route: lane.route, picker: { kind: "model", modelTargets: {
+      lane: { id: lane.id, generation: lane.generation, sessionId: worker.state.sessionId, current: "fixture/capable" },
+    } } });
+    const missing = pickerClick(card, 0, 1);
+    await expect(runtime.receive(missing)).rejects.toThrow("original owner command and card");
+    expect(store.input(missing.id)).toBeNull();
+    expect(main.state.model).toEqual(executionModel);
+    expect(worker.state.model).toEqual(executionModel);
+    expect(messenger.sent).toHaveLength(1);
+
+    const click = pickerClick(card, 0, 1, { target: "head" });
+    await admit(runtime, click);
+    await admit(runtime, click);
+    expect(store.input(click.id)).toMatchObject({ state: "done", route: lane.route });
+    expect(main.state.model).toEqual(otherModel);
+    expect(main.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+    expect(store.lane(lane.id)?.model).toEqual(executionModel);
+    expect(worker.state.model).toEqual(executionModel);
+    expect(worker.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+    expect(messenger.sent.filter(output => output.sourceId === click.id)).toMatchObject([
+      { route: lane.route, text: expect.stringContaining("HEAD session only") },
+    ]);
+    expect(launched).toEqual([]);
+    expect(main.prompts).toEqual([]);
+    expect(worker.prompts).toEqual([]);
+  });
+
+  test("a slow bound lane cannot delay its Discord model menu or unrelated HEAD work", async () => {
+    const { runtime, config, main, store, messenger, hosts } = fixture();
+    const lane = savedLane(store, config, "picker-slow", route("picker-slow"), process.pid);
+    const worker = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, worker);
+    await runtime.start();
+    const read = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    worker.beforeState = () => { read.resolve(); return release.promise; };
+    const open = applicationCommand("11022", lane.route, "/model");
+    try {
+      await runtime.receive(open);
+      expect(await Promise.race([
+        messenger.whenSent(1).then(() => "menu"), read.promise.then(() => "lane state"),
+      ])).toBe("menu");
+      const card = store.output(`${open.id}:head-control`);
+      expect(card?.picker).toMatchObject({ modelTargets: { lane: { id: lane.id, current: "fixture/capable" } } });
+      await runtime.receive(headMessage("unrelated-while-lane-slow", route(null)));
+      await main.whenPrompts(1);
+      expect(store.input("unrelated-while-lane-slow")?.state).toBe("submitted");
+    } finally { worker.beforeState = undefined; release.resolve(); }
+  });
+
+  test("Discord model menus accept either physical bot address but not another mention or a voice projection", async () => {
+    const { runtime, store, main } = fixture();
+    await runtime.start();
+    for (const [original, accepted] of [
+      ["<@2> /model", true], ["/model <@!2>", true], ["<@!2>/model<@2>", true],
+      ["/model <@3>", false], ["/voice confirm <@2>", false],
+    ] as const) {
+      const open = { ...message(`mentioned-picker:${original}`, route(), "/model"), discordOriginalText: original };
+      await admit(runtime, open);
+      const picker = store.output(`${open.id}:head-control`)?.picker;
+      if (accepted) expect(picker?.kind).toBe("model");
+      else {
+        expect(picker).toBeUndefined();
+        expect(store.input(open.id)?.state).toBe("cancelled");
+      }
+    }
+    expect(main.prompts).toEqual([]);
+  });
+
+  test.each(["rebinding", "a generation change", "a native session change", "a wrong-card receipt", "expiry"] as const)(
+    "a Discord lane card cannot mutate either destination after %s", async stale => {
+      const { runtime, config, main, store, messenger, launched } = fixture();
+      const first = savedLane(store, config, "picker-original-binding", route("picker-original-thread"));
+      const second = savedLane(store, config, "picker-replacement-binding", route("picker-replacement-thread"));
+      const dm = route(null, { guildId: null });
+      await runtime.start();
+      await admit(runtime, message("11011", dm, "/new"));
+      const logicalRoute = store.input("11011")?.route;
+      if (!logicalRoute?.topicId) throw new Error("Expected a Discord DM topic for the binding");
+      const bindingKey = `topic-binding:${routeKey(logicalRoute)}`;
+      store.setMeta(bindingKey, JSON.stringify({ source: logicalRoute, destination: first.route, laneId: first.id }));
+      const open = applicationCommand("11012", dm, "/model");
+      await admit(runtime, open);
+      const card = messenger.sent.find(output => output.sourceId === open.id);
+      if (!card?.picker) throw new Error("Expected a menu on the first logical binding");
+      expect(card).toMatchObject({ route: logicalRoute, picker: { modelTargets: {
+        lane: { id: first.id, generation: first.generation, sessionId: first.sessionId },
+      } } });
+
+      if (stale === "rebinding") {
+        store.setMeta(bindingKey, JSON.stringify({ source: logicalRoute, destination: second.route, laneId: second.id }));
+      } else if (stale === "a generation change") {
+        store.nextGeneration(first.id);
+      } else if (stale === "a native session change") {
+        expect(store.updateLane(first.id, first.generation, { sessionId: "replacement-native-session" })).toBe(true);
+      }
+      const click = pickerClick(card, 0, 1, {
+        target: "lane", ...(stale === "a wrong-card receipt" ? { cardId: `remote-${card.id}:other` } : {}),
+      });
+      const clock = stale === "expiry" ? spyOn(Date, "now").mockReturnValue(card.picker.expiresAt) : undefined;
+      try { await admit(runtime, click); }
+      finally { clock?.mockRestore(); }
+
+      expect(store.input(click.id)).toMatchObject({ state: "cancelled", route: logicalRoute });
+      expect(messenger.sent.filter(output => output.sourceId === click.id)).toMatchObject([{ route: logicalRoute }]);
+      expect(store.lane(first.id)?.model).toEqual(executionModel);
+      expect(store.lane(second.id)?.model).toEqual(executionModel);
+      expect(main.state.model).toEqual(executionModel);
+      expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+      expect(main.prompts).toEqual([]);
+      expect(launched).toEqual([]);
+    },
+  );
+
+  test.each(["Discord effort", "legacy Discord model", "Telegram model", "Slack model"] as const)(
+    "a forged model target cannot turn a legacy %s card into a scoped selection", async kind => {
+      const { runtime, config, main, store, messenger } = fixture();
+      config.telegram = { tokenEnv: "TEST_TELEGRAM", ownerId: "1", allowedChatIds: ["3"] };
+      config.slack = { botTokenEnv: "TEST_SLACK", appTokenEnv: "TEST_SLACK_APP", ownerId: "1", teamId: "TTEAM", allowedChannelIds: ["4"] };
+      const destination = kind === "Telegram model" ? route("10", { platform: "telegram", channelId: "3" })
+        : kind === "Slack model" ? route(null, { platform: "slack", accountId: "TTEAM:UBOT", guildId: "TTEAM" }) : route();
+      const command = kind === "Discord effort" ? "/effort" : "/model";
+      const open = kind === "Slack model" ? slackCommand("model-target-forgery", destination, command)
+        : message("11013", destination, command);
+      await runtime.start();
+      if (kind === "legacy Discord model") {
+        // Simulate a queued card saved by a version that predates target metadata.
+        store.receive(open, "main", { [`user-source:${open.id}`]: "true" });
+        store.settle(open.id, "done", { id: `${open.id}:head-control`, text: "Select the HEAD model", picker: {
+          kind: "model", sessionId: main.state.sessionId, generation: 0, expiresAt: Date.now() + 60_000,
+          groups: [{ label: "fixture", options: ["fixture/capable", "fixture/efficient"] }],
+        } });
+        await runtime.kick();
+      } else await admit(runtime, open);
+      const card = messenger.sent.find(output => output.sourceId === open.id);
+      if (!card?.picker) throw new Error("Expected the legacy picker");
+      expect(card.picker).not.toHaveProperty("modelTargets");
+      const valid = pickerClick(card, 0, 1);
+      await expect(runtime.receive(pickerClick(card, 0, 1, { target: "head" }))).rejects.toThrow("original owner command and card");
+      expect(store.input(valid.id)).toBeNull();
+      expect(main.state).toMatchObject({ model: executionModel, thinkingLevel: "high" });
+      expect(messenger.sent).toHaveLength(1);
+
+      await admit(runtime, valid);
+      expect(store.input(valid.id)?.state).toBe("done");
+      expect(main.state).toMatchObject(kind === "Discord effort" ? { model: executionModel, thinkingLevel: "minimal" }
+        : { model: otherModel, thinkingLevel: "high" });
+      expect(messenger.sent.filter(output => output.sourceId === valid.id)).toMatchObject([{ route: destination }]);
+      expect(main.prompts).toEqual([]);
+    },
+  );
 
   test.each(["minimal", undefined])("text Auto verifies its configured selector independently of effective effort %s", async effective => {
     const { runtime, main, store, messenger } = fixture();
@@ -5807,21 +8000,24 @@ describe("messenger head session controls", () => {
     expect(main.commands.filter(command => command.type === "set_thinking_level")).toEqual([]);
   });
 
-  test.each(["unconfirmed", "wrong-card"] as const)("a %s menu receipt cannot authorize a HEAD model change", async receipt => {
+  test.each(["unconfirmed", "wrong-card", "expired"] as const)("a %s menu receipt cannot authorize a HEAD model change", async receipt => {
     const { runtime, main, store, messenger } = fixture();
     await runtime.start();
     if (receipt === "unconfirmed") messenger.sendError = new DeliveryError("Lost fixture send receipt", "uncertain");
     await admit(runtime, message("701", route(), "/model"));
     messenger.sendError = undefined;
     const output = messenger.attempted.find(candidate => !!candidate.picker);
-    if (!output) throw new Error("Expected an attempted menu delivery");
-    const click = pickerClick(output, 0, 1);
-    const original = click.pickerSelection;
-    if (!original) throw new Error("Expected a picker receipt");
-    await admit(runtime, receipt === "wrong-card" ? { ...click, pickerSelection: { ...original, cardId: "another-card" } } : click);
+    if (!output?.picker) throw new Error("Expected an attempted menu delivery");
+    const click = pickerClick(output, 0, 1, {
+      target: "head", ...(receipt === "wrong-card" ? { cardId: "another-card" } : {}),
+    });
+    const clock = receipt === "expired" ? spyOn(Date, "now").mockReturnValue(output.picker.expiresAt) : undefined;
+    try { await admit(runtime, click); }
+    finally { clock?.mockRestore(); }
     expect(store.input(click.id)?.state).toBe("cancelled");
     expect(main.state.model).toEqual(executionModel);
     expect(main.commands.filter(command => command.type === "set_model")).toEqual([]);
+    expect(main.prompts).toEqual([]);
   });
 
   test("the selected provider disambiguates the full identity and keeps native model IDs with spaces", async () => {
@@ -5836,7 +8032,7 @@ describe("messenger head session controls", () => {
       if (!output?.picker) throw new Error("Expected the native catalogue menu");
       const group = output.picker.groups.findIndex(candidate => candidate.label === model.provider);
       const option = output.picker.groups[group]?.options.indexOf(`${model.provider}/${model.id}`) ?? -1;
-      await admit(runtime, pickerClick(output, group, option));
+      await admit(runtime, pickerClick(output, group, option, { target: "head" }));
       expect(main.state.model).toEqual(model);
     }
   });
@@ -5944,7 +8140,7 @@ describe("messenger head session controls", () => {
   });
 
   test("mutations refuse active main input while read-only diagnostics remain available", async () => {
-    const { runtime, main, store } = fixture();
+    const { runtime, main, store, messenger } = fixture();
     await runtime.start();
     await admit(runtime, headMessage("head-active-original"));
     for (const [index, text] of ["/model fixture/efficient", "/effort off"].entries()) {
@@ -5953,6 +8149,15 @@ describe("messenger head session controls", () => {
     }
     await admit(runtime, message("head-busy-diagnostic", route(), "/model"));
     expect(store.input("head-busy-diagnostic")?.state).toBe("done");
+    const card = messenger.sent.find(output => output.sourceId === "head-busy-diagnostic");
+    if (!card?.picker) throw new Error("Expected a model menu while HEAD is busy");
+    const click = pickerClick(card, 0, 1, { target: "head" });
+    await admit(runtime, click);
+    expect(store.input(click.id)?.state).toBe("cancelled");
+    expect(messenger.sent.filter(output => output.sourceId === click.id)).toMatchObject([
+      { route: card.route, text: expect.stringContaining("HEAD is busy") },
+    ]);
+    expect(main.state.model).toEqual(executionModel);
     expect(main.commands.filter(command => command.type === "set_model" || command.type === "set_thinking_level")).toEqual([]);
     expect(main.prompts).toHaveLength(1);
   });
@@ -6426,6 +8631,8 @@ esac
     if (!click.pickerSelection) throw new Error("Expected a card interaction");
     const confirmed: Inbound = { ...click, pickerSelection: { ...click.pickerSelection, confirmed: true } };
     await expect(runtime.receive(click)).rejects.toThrow();
+    await expect(runtime.receive(pickerClick(card, 0, 1, { confirmed: true, target: "head" })))
+      .rejects.toThrow("original owner command and card");
     await expect(runtime.receive({ ...confirmed, route: { ...open.route, threadId: "13" } })).rejects.toThrow();
     await expect(runtime.receive({ ...confirmed, route: { ...open.route, authorityId: "8" } })).rejects.toThrow();
     const typedTarget = outcome === "unconfirmed" ? "/usage reset anthropic/9" : "/usage-reset anthropic/9";
@@ -7438,6 +9645,511 @@ describe("trusted workflow activation", () => {
 });
 
 describe("explicit lane-local model changes", () => {
+  test.each(["verified fallback", "unrecognized active model"] as const)(
+    "an owner selecting the %s persists it before release and cold restore", async origin => {
+      const { runtime, store, config, hosts, launched, launchBehavior } = fixture();
+      const pid = 2147483647;
+      const lane = savedLane(store, config, "promote-cold-model", route("40"), pid);
+      const host = new HostTransport(lane.sessionFile, `session-${lane.id}`, otherModel);
+      host.state.hostPid = pid;
+      host.shutdownDisconnect = true;
+      recordedModelChanges(host, [{ model: "fixture/capable" },
+        { model: "fixture/efficient", role: "fallback", fallback: origin === "verified fallback" }]);
+      legacyTranscript(lane, executionModel);
+      hosts.set(lane.socketPath, host);
+      markMockHostEndpoint(host, lane.socketPath);
+      const quotaKey = `lane-quota-hold:${lane.id}`;
+      store.setMeta(quotaKey, "held-native-work");
+      await runtime.start();
+      expect(await runtime.inspect(lane.id)).toMatchObject({ model: executionModel, state: { model: otherModel },
+        modelCheck: { error: origin === "verified fallback" ? null : expect.stringContaining("model drift") } });
+
+      const choice = message("11084", lane.route, "/model --lane fixture/efficient");
+      await admit(runtime, choice);
+      expect(store.input(choice.id)?.state).toBe("done");
+      expect(store.getMeta(quotaKey)).toBe("");
+      expect(host.commands.filter(command => command.type === "set_lane_model").map(command => command.modelId)).toEqual(["efficient"]);
+
+      const { idleMs } = config;
+      config.idleMs = 0;
+      try { await runtime.kick(); }
+      finally { config.idleMs = idleMs; }
+      expect(store.lane(lane.id)).toMatchObject({ runtimeState: "unloaded", pid: null, sessionId: host.state.sessionId });
+      const defaults = host.entries.filter(entry => typeof entry === "object" && entry !== null
+        && "type" in entry && entry.type === "model_change" && "model" in entry
+        && (!("role" in entry) || entry.role === undefined || entry.role === "default"));
+      const restored = defaults.at(-1);
+      if (typeof restored !== "object" || !restored || !("model" in restored)) throw new Error("Expected a saved native default");
+      const restoredModel = [executionModel, otherModel].find(model => `${model.provider}/${model.id}` === restored.model);
+      if (!restoredModel) throw new Error("Expected the native journal to name an available model");
+      launchBehavior.model = restoredModel;
+      launchBehavior.journalEntries = host.entries;
+      const next = message("11085", lane.route, "Use the persisted choice after cold restore.");
+      await admit(runtime, next);
+      expect(launched).toHaveLength(1);
+      expect(launched[0]).not.toHaveProperty("model");
+      const active = hosts.get(lane.socketPath);
+      expect(active?.state.model).toEqual(otherModel);
+      expect(active?.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(next.text)]);
+    },
+  );
+
+  test.each(["fallback only", "off-branch default", "durable default", "legacy unambiguous default",
+    "unknown branch", "colliding pair receipt", "legacy colliding selector"] as const)(
+    "an ambiguous fallback promotion retry distinguishes %s from exact active-branch persistence", async evidence => {
+      const { runtime, store, config, hosts, main } = fixture();
+      const lane = savedLane(store, config, "retry-promoted-model", route("40"), process.pid);
+      const collision = evidence === "colliding pair receipt" || evidence === "legacy colliding selector";
+      const chosen = collision ? { provider: "fixture/path", id: "efficient" } : otherModel;
+      const selector = `${chosen.provider}/${chosen.id}`;
+      if (collision) main.models.push(chosen, { provider: "fixture", id: "path/efficient" });
+      const host = new HostTransport(lane.sessionFile, `session-${lane.id}`, chosen);
+      recordedModelChanges(host, [
+        { model: "fixture/capable" },
+        ...(evidence === "off-branch default" ? [{ model: selector }] : []),
+        { model: selector, role: "fallback", fallback: true, parent: 0 },
+      ]);
+      hosts.set(lane.socketPath, host);
+      const quotaKey = `lane-quota-hold:${lane.id}`;
+      store.setMeta(quotaKey, "held-native-work");
+      await runtime.start();
+      const choose = async (id: string) => {
+        if (!collision) return message(id, lane.route, `/model --lane ${selector}`);
+        const open = applicationCommand(id, lane.route, "/model");
+        await admit(runtime, open);
+        const card = store.output(`${open.id}:head-control`);
+        const group = card?.picker?.groups.findIndex(group => group.label === chosen.provider) ?? -1;
+        const option = card?.picker?.groups[group]?.options.indexOf(selector) ?? -1;
+        if (!card || group < 0 || option < 0) throw new Error("Expected the exact provider/ID option");
+        return pickerClick(card, group, option, { target: "lane" });
+      };
+
+      const unapplied = evidence === "fallback only" || evidence === "off-branch default";
+      host.modelSetResult = unapplied ? "throw-before" : "throw-after";
+      const first = await choose("11086");
+      await admit(runtime, first);
+      expect(store.input(first.id)?.state).toBe("cancelled");
+      expect(store.lane(lane.id)?.model).toEqual(executionModel);
+      expect(store.getMeta(quotaKey)).toBe("held-native-work");
+      expect(host.state.model).toEqual(chosen);
+      if (evidence === "unknown branch") host.journalLeaf = false;
+      if (evidence === "legacy unambiguous default" || evidence === "legacy colliding selector") host.entries.pop();
+      host.modelSetResult = "success";
+
+      const retry = await choose("11087");
+      await admit(runtime, retry);
+      const held = evidence === "unknown branch" || evidence === "legacy colliding selector";
+      expect(store.input(retry.id)?.state).toBe(held ? "cancelled" : "done");
+      expect(store.lane(lane.id)?.model).toEqual(held ? executionModel : chosen);
+      expect(store.getMeta(quotaKey)).toBe(held ? "held-native-work" : "");
+      expect(store.getMeta(`lane-model:${lane.id}:receipt:${retry.id}`)).toEqual(held ? null : expect.any(String));
+      expect(host.commands.filter(command => command.type === "set_lane_model").map(command => command.modelId))
+        .toEqual(unapplied ? [chosen.id, chosen.id] : [chosen.id]);
+    },
+  );
+
+  test("passive inspection cannot commit an ambiguous promotion while only the fallback is active", async () => {
+    const { runtime, store, config, hosts } = fixture();
+    const lane = savedLane(store, config, "inspect-unapplied-promotion", route("40"), process.pid);
+    const host = new HostTransport(lane.sessionFile, `session-${lane.id}`, otherModel);
+    recordedModelChanges(host, [{ model: "fixture/capable" }, { model: "fixture/efficient", role: "fallback", fallback: true }]);
+    hosts.set(lane.socketPath, host);
+    await runtime.start();
+    const sourceId = modelChangeSource(store, "inspect-unapplied-promotion-change");
+    host.modelSetResult = "throw-before";
+    await expect(runtime.changeModel({ id: lane.id, sourceId, model: otherModel, modelReason: "Persist the currently serving fallback." }))
+      .rejects.toThrow("outcome unknown");
+
+    expect(await runtime.inspect(lane.id)).toMatchObject({ model: executionModel, state: { model: otherModel },
+      modelChange: { sourceId }, queueHolds: { runtimeBlocked: true } });
+    expect(store.getMeta(`lane-model:${lane.id}:receipt:${sourceId}`)).toBeNull();
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
+  });
+
+  test.each(["pending", "committed"] as const)("lane_set_model keeps its own readback with a %s later Discord choice", async later => {
+    const { runtime, store, config, hosts, main, messenger } = fixture();
+    const lane = savedLane(store, config, "switch-picker-order", route("40"), process.pid);
+    const host = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+    hosts.set(lane.socketPath, host);
+    const alternate = { provider: "fixture", id: "alternate" };
+    main.models.push(alternate);
+    await runtime.start();
+    const open = applicationCommand("11025", lane.route, "/model");
+    await admit(runtime, open);
+    await waitForOutput(messenger, `${open.id}:head-control`);
+    const card = store.output(`${open.id}:head-control`);
+    const option = card?.picker?.groups[0]?.options.indexOf("fixture/alternate") ?? -1;
+    if (!card || option < 0) throw new Error("Expected the alternative model on the bound Discord card");
+    const click = pickerClick(card, 0, option, { target: "lane" });
+
+    // Hold a separate post-commit readback if the manager request makes one.
+    // Once A returns from its own readback, B must not alter that response.
+    const read = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    main.beforeCatalog = () => {
+      if (store.lane(lane.id)?.model?.id !== otherModel.id) return;
+      main.beforeCatalog = undefined;
+      read.resolve();
+      return releaseRead.promise;
+    };
+    const first = runtime.changeModel({ id: lane.id, sourceId: modelChangeSource(store, "switch-manager-first"),
+      model: otherModel, modelReason: "First manager choice." });
+    const ownerEffect = Promise.withResolvers<void>();
+    const releaseOwner = Promise.withResolvers<void>();
+    const second = (async () => {
+      await Promise.race([first.then(() => {}), read.promise]);
+      main.beforeCatalog = undefined;
+      if (later === "pending") host.beforeSetModel = () => {
+        ownerEffect.resolve();
+        return releaseOwner.promise;
+      };
+      await admit(runtime, click);
+    })();
+    try {
+      if (later === "pending") {
+        await Promise.race([ownerEffect.promise, second.then(() => { throw new Error("Expected the later owner mutation to be in flight"); })]);
+      } else await second;
+      releaseRead.resolve();
+      expect(await first).toMatchObject({ model: otherModel, state: { model: otherModel }, modelChange: null,
+        modelCheck: { expected: otherModel, actual: otherModel, error: null }, queueHolds: { runtimeBlocked: false } });
+      releaseOwner.resolve();
+      await second;
+      expect(store.input(click.id)?.state).toBe("done");
+      expect(store.lane(lane.id)).toMatchObject({ model: alternate, runtimeState: "idle" });
+      expect(host.state.model).toEqual(alternate);
+    } finally {
+      main.beforeCatalog = undefined;
+      releaseRead.resolve();
+      releaseOwner.resolve();
+      await Promise.allSettled([first, second]);
+    }
+  });
+
+  test.each(["goal during HEAD read", "async work during HEAD read", "dialog during HEAD read",
+    "goal after lane snapshot", "dialog after lane snapshot", "source revoked after lane snapshot"] as const)(
+    "a scoped Discord model click sends no mutation with %s", async race => {
+      const { runtime, store, config, hosts, main, messenger } = fixture();
+      const lane = savedLane(store, config, "switch-picker-idle", route("40"), process.pid);
+      const host = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+      hosts.set(lane.socketPath, host);
+      await runtime.start();
+      const open = applicationCommand("11026", lane.route, "/model");
+      await admit(runtime, open);
+      await waitForOutput(messenger, `${open.id}:head-control`);
+      const card = store.output(`${open.id}:head-control`);
+      if (!card?.picker) throw new Error("Expected the bound Discord card");
+      const click = pickerClick(card, 0, 1, { target: "lane" });
+
+      const read = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const pause = () => { read.resolve(); return release.promise; };
+      const afterSnapshot = race.endsWith("after lane snapshot");
+      if (afterSnapshot) host.afterState = pause;
+      else main.beforeState = pause;
+      const choosing = admit(runtime, click);
+      try {
+        await Promise.race([read.promise, choosing.then(() => { throw new Error("Expected a pending native state read"); })]);
+        if (race.startsWith("goal")) {
+          host.state.goal = { enabled: true };
+          if (afterSnapshot) host.emit({ type: "goal_updated", state: host.state.goal });
+        } else if (race.startsWith("dialog")) {
+          // A secret native dialog supplies no Messenger approval fence.
+          const dialog = { type: "extension_ui_request", id: "new-native-dialog", method: "confirm", secret: true };
+          host.state.pendingUiRequests = [dialog];
+          host.uiAcknowledges = false;
+          if (afterSnapshot) host.emit(dialog);
+        } else if (race.startsWith("async work")) {
+          host.state.hasPendingAsyncWork = true;
+        } else {
+          expect(store.settle(click.id, "cancelled")).toBe(true);
+        }
+      } finally {
+        host.afterState = undefined;
+        main.beforeState = undefined;
+        release.resolve();
+        await choosing;
+      }
+      expect(store.input(click.id)?.state).toBe("cancelled");
+      expect(store.approvals(lane.id)).toEqual([]);
+      expect(store.lane(lane.id)?.model).toEqual(executionModel);
+      expect(host.state.model).toEqual(executionModel);
+      expect(host.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+      expect(store.getMeta(`lane-model:${lane.id}:pending`)).toBeNull();
+    },
+  );
+
+  test.each(["rejected", "busy"] as const)("a definitive bound-owner model refusal (%s) clears the intent and permits a different explicit choice", async refusal => {
+    const { runtime, store, config, hosts, main, messenger } = fixture();
+    const lane = savedLane(store, config, "operator-refusal", route("40"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-operator-refusal");
+    const alternate = { provider: "fixture", id: "alternate" };
+    main.models.push(alternate);
+    hosts.set(lane.socketPath, host);
+    await runtime.start();
+    host.modelSetResult = refusal;
+    const refused = message("operator-refused-model", lane.route, "/model --lane fixture/efficient");
+    await admit(runtime, refused);
+    await waitForOutput(messenger, `${refused.id}:head-control`);
+    await admit(runtime, refused);
+
+    expect(store.input(refused.id)?.state).toBe("cancelled");
+    expect(store.output(`${refused.id}:head-control`)?.text).not.toContain("secret endpoint");
+    if (refusal === "busy") expect(store.output(`${refused.id}:head-control`)?.text).toContain("작업 중");
+    expect(await runtime.inspect(lane.id)).toMatchObject({ model: executionModel, state: { model: executionModel }, modelChange: null });
+    expect(store.getMeta(`lane-model:${lane.id}:receipt:${refused.id}`)).toBeNull();
+    host.state.isSettled = true;
+    host.modelSetResult = "success";
+    const accepted = message("operator-new-choice", lane.route, "/model --lane fixture/alternate");
+    await admit(runtime, accepted);
+    expect(store.input(accepted.id)?.state).toBe("done");
+    expect(store.lane(lane.id)?.model).toEqual(alternate);
+    expect(host.state.model).toEqual(alternate);
+    expect(host.commands.filter(command => command.type === "set_lane_model").map(command => command.modelId)).toEqual(["efficient", "alternate"]);
+    expect(main.prompts).toEqual([]);
+    expect(host.prompts).toEqual([]);
+  });
+
+  test.each([
+    ["throw-before", executionModel, ["efficient", "efficient"]],
+    ["throw-after", otherModel, ["efficient"]],
+  ] as const)("a new exact owner command reconciles %s by native readback, not by redelivery", async (transport, nativeModel, mutations) => {
+    const { runtime, store, config, hosts, main } = fixture();
+    const lane = savedLane(store, config, "operator-reconcile", route("40"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-operator-reconcile");
+    hosts.set(lane.socketPath, host);
+    await runtime.start();
+    host.modelSetResult = transport;
+    const choice = "/model --lane fixture/efficient";
+    const first = message("operator-missing-outcome", lane.route, choice);
+    await admit(runtime, first);
+    expect(store.input(first.id)?.state).toBe("cancelled");
+    expect(host.state.model).toEqual(nativeModel);
+    expect(await runtime.inspect(lane.id)).toMatchObject({ model: executionModel, modelChange: { sourceId: first.id } });
+    host.modelSetResult = "success";
+
+    await admit(runtime, first);
+    await admit(runtime, message("operator-wrong-choice", lane.route, "/model --lane fixture/capable"));
+    await admit(runtime, message("operator-unbound-retry", route("41"), choice));
+    const originalSettings = host.state.modelSettings;
+    host.state.modelSettings = { modelRoles: { default: "fixture/conflicting-native-role" } };
+    await admit(runtime, message("operator-conflicting-settings", lane.route, choice));
+    host.state.modelSettings = originalSettings;
+    host.state.model = { provider: "fixture", id: "conflicting-native-model" };
+    await admit(runtime, message("operator-conflicting-model", lane.route, choice));
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
+    expect(store.lane(lane.id)?.model).toEqual(executionModel);
+    expect(store.getMeta(`lane-model:${lane.id}:receipt:${first.id}`)).toBeNull();
+    expect(store.input("operator-conflicting-model")?.state).toBe("cancelled");
+
+    host.state.model = nativeModel;
+    const next = message("operator-exact-fresh-retry", lane.route, choice);
+    await admit(runtime, next);
+    expect(store.input(next.id)?.state).toBe("done");
+    expect(store.lane(lane.id)?.model).toEqual(otherModel);
+    expect(host.state.model).toEqual(otherModel);
+    expect(host.commands.filter(command => command.type === "set_lane_model").map(command => command.modelId)).toEqual([...mutations]);
+    expect(main.prompts).toEqual([]);
+    expect(host.prompts).toEqual([]);
+  });
+
+  test.each(["fresh card", "typed selector", "cold card"] as const)(
+    "an exact %s reconciles a lost lane model result without changing to a colliding pair", async retry => {
+      const { runtime, store, config, main, hosts, launched, launchBehavior } = fixture();
+      const lane = savedLane(store, config, "operator-collision", route("40"), process.pid);
+      const worker = new HostTransport(lane.sessionFile, `session-${lane.id}`);
+      hosts.set(lane.socketPath, worker);
+      const selected = { provider: "fixture/path", id: "target" };
+      const collision = { provider: "fixture", id: "path/target" };
+      const selector = "fixture/path/target";
+      main.models.push(collision, selected);
+      await runtime.start();
+
+      if (retry === "typed selector") {
+        const ambiguous = message("11029", lane.route, `/model --lane ${selector}`);
+        await admit(runtime, ambiguous);
+        expect(store.input(ambiguous.id)?.state).toBe("cancelled");
+        expect(store.lane(lane.id)?.model).toEqual(executionModel);
+        expect(worker.state.model).toEqual(executionModel);
+        expect(worker.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+      }
+
+      const choose = async (id: string, provider: string) => {
+        const open = applicationCommand(id, lane.route, "/model");
+        await admit(runtime, open);
+        const card = store.output(`${open.id}:head-control`);
+        if (card?.picker?.kind !== "model" || !card.picker.modelTargets?.lane) throw new Error("Expected the bound lane model menu");
+        const group = card.picker.groups.findIndex(candidate => candidate.label === provider);
+        const option = card.picker.groups[group]?.options.indexOf(selector) ?? -1;
+        if (group < 0 || option < 0) throw new Error(`Expected ${provider} to offer ${selector}`);
+        return pickerClick(card, group, option, { target: "lane" });
+      };
+
+      worker.modelSetResult = "throw-after";
+      const original = await choose("11030", selected.provider);
+      await admit(runtime, original);
+      expect(store.input(original.id)?.state).toBe("cancelled");
+      expect(worker.state.model).toEqual(selected);
+      expect(store.lane(lane.id)?.model).toEqual(executionModel);
+      worker.modelSetResult = "success";
+
+      const wrongPair = await choose("11031", collision.provider);
+      await admit(runtime, wrongPair);
+      expect(store.input(wrongPair.id)?.state).toBe("cancelled");
+      if (retry === "typed selector") {
+        main.models = main.models.filter(model => model !== selected);
+        const missing = message("11032", lane.route, `/model --lane ${selector}`);
+        await admit(runtime, missing);
+        expect(store.input(missing.id)?.state).toBe("cancelled");
+        expect(store.lane(lane.id)?.model).toEqual(executionModel);
+        main.models.push(selected);
+      } else if (retry === "cold card") {
+        store.updateLane(lane.id, lane.generation, { pid: null });
+        hosts.delete(lane.socketPath);
+        await worker.close();
+        await runtime.kick();
+        legacyTranscript({ ...lane, id: "different-native-session" }, selected);
+        const wrongSession = await choose("11032", selected.provider);
+        await admit(runtime, wrongSession);
+        expect(store.input(wrongSession.id)?.state).toBe("cancelled");
+        expect(launched).toEqual([]);
+        expect(store.lane(lane.id)?.generation).toBe(lane.generation);
+        legacyTranscript(lane, selected);
+        launchBehavior.model = worker.state.model;
+      }
+
+      const next = retry === "typed selector" ? message("11033", lane.route, `/model --lane ${selector}`) : await choose("11033", selected.provider);
+      await admit(runtime, next);
+      await admit(runtime, next);
+      expect(store.input(next.id)?.state).toBe("done");
+      expect(store.lane(lane.id)).toMatchObject({ model: selected, sessionId: worker.state.sessionId,
+        generation: lane.generation + Number(retry === "cold card") });
+      const active = hosts.get(lane.socketPath);
+      expect(active?.state.model).toEqual(selected);
+      expect(launched).toHaveLength(Number(retry === "cold card"));
+      if (retry === "cold card") expect(active?.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+      expect(worker.commands.filter(command => command.type === "set_lane_model").map(command => [command.provider, command.modelId]))
+        .toEqual([[selected.provider, selected.id]]);
+      expect(active?.prompts).toEqual([]);
+      expect(main.prompts).toEqual([]);
+    },
+  );
+
+  test.each([
+    ["success", "done"],
+    ["throw-after", "cancelled"],
+  ] as const)("controller restart settles a lost lane-model ACK from its own commit receipt (%s) without holding HEAD", async (transport, outcome) => {
+    const { runtime, directory, store, config, hosts } = fixture();
+    const lane = savedLane(store, config, "operator-restart", route("40"), process.pid);
+    const host = new HostTransport(lane.sessionFile, "session-operator-restart");
+    hosts.set(lane.socketPath, host);
+    const choice = message("operator-ack-lost", lane.route, "/model --lane fixture/efficient");
+    const unrelated = headMessage("unrelated-after-operator-ack", route("41"), "Check the independent invoice.");
+    await runtime.start();
+    host.modelSetResult = transport;
+    const settle = store.settle.bind(store);
+    store.settle = (id, ...args) => id === choice.id ? false : settle(id, ...args);
+    await admit(runtime, choice);
+    await admit(runtime, unrelated);
+    expect(store.input(choice.id)?.state).toBe("submitted");
+    expect(store.output(`${choice.id}:head-control`)).toBeNull();
+    expect(store.lane(lane.id)?.model).toEqual(outcome === "done" ? otherModel : executionModel);
+    expect(host.state.model).toEqual(otherModel);
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
+    await runtime.stop();
+
+    const reopened = new Store(join(directory, "coordination.sqlite"));
+    const messenger = new MessengerTransport();
+    const headPaths = hostPaths(config, "main");
+    const head = new HostTransport(headPaths.sessionFile, "session-main");
+    const retained = new HostTransport(lane.sessionFile, "session-operator-restart", otherModel);
+    const restarted = new Superagent(config, reopened, messenger, join(directory, "extension.ts"), () => {}, {
+      connect: async path => {
+        if (path === lane.socketPath) return retained;
+        if (path === headPaths.socketPath) return head;
+        throw new Error("Unexpected native owner");
+      },
+    });
+    const tracked = fixtures.find(entry => entry.runtime === runtime);
+    if (!tracked) throw new Error("Missing runtime fixture");
+    tracked.runtime = restarted;
+    await restarted.start();
+    await waitForOutput(messenger, `${choice.id}:head-control`);
+    await admit(restarted, choice);
+    expect(reopened.input(choice.id)?.state).toBe(outcome);
+    expect(reopened.lane(lane.id)?.model).toEqual(outcome === "done" ? otherModel : executionModel);
+    expect(messenger.sent.filter(output => output.sourceId === choice.id)).toMatchObject([
+      { route: lane.route, replyTo: { route: lane.route, messageId: choice.messageId } },
+    ]);
+    expect(await restarted.inspect(lane.id)).toMatchObject({
+      modelChange: outcome === "done" ? null : { sourceId: choice.id },
+    });
+    expect(retained.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+    await head.whenPrompts(1);
+    expect(head.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining("Check the independent invoice.")]);
+  });
+
+  test.each(["first launch", "transcript restore"] as const)(
+    "restart acknowledges the original cold lane card after deferred native application on %s", async wake => {
+      const { runtime, directory, store, config, hosts, launched, messenger } = fixture();
+      const lane = savedLane(store, config, "operator-cold-ack", route("40"));
+      if (wake === "transcript restore") {
+        legacyTranscript(lane, executionModel);
+        expect(store.updateLane(lane.id, lane.generation, { sessionId: `session-${lane.id}` })).toBe(true);
+      }
+      await runtime.start();
+      const open = applicationCommand("11034", lane.route, "/model");
+      await admit(runtime, open);
+      const card = store.output(`${open.id}:head-control`);
+      if (card?.picker?.kind !== "model" || !card.picker.modelTargets?.lane) throw new Error("Expected the cold lane model menu");
+      const click = pickerClick(card, 0, 1, { target: "lane" });
+      const settle = store.settle.bind(store);
+      store.settle = (id, ...args) => id === click.id ? false : settle(id, ...args);
+      await admit(runtime, click);
+      expect(store.input(click.id)?.state).toBe("submitted");
+      expect(store.output(`${click.id}:head-control`)).toBeNull();
+      expect(store.lane(lane.id)?.model).toEqual(otherModel);
+      expect(launched).toEqual([]);
+
+      const work = message("11035", lane.route, "Check this independent invoice.");
+      await admit(runtime, work);
+      const worker = hosts.get(lane.socketPath);
+      if (!worker) throw new Error("Expected the selected lane to wake for work");
+      await worker.whenPrompts(1);
+      worker.complete("Checked the independent invoice.");
+      await waitForOutput(messenger, `handoff:${work.id}:${lane.id}:answer`);
+      expect(store.lane(lane.id)).toMatchObject({ generation: lane.generation + 1, sessionId: worker.state.sessionId });
+      expect(worker.state.model).toEqual(otherModel);
+      expect(worker.commands.filter(command => command.type === "set_lane_model").map(command => command.modelId))
+        .toEqual(wake === "transcript restore" ? [otherModel.id] : []);
+      await runtime.stop();
+
+      const reopened = new Store(join(directory, "coordination.sqlite"));
+      const recoveredMessenger = new MessengerTransport();
+      const headPaths = hostPaths(config, "main");
+      const head = new HostTransport(headPaths.sessionFile, "session-main");
+      const retained = new HostTransport(lane.sessionFile, worker.state.sessionId, otherModel);
+      const restarted = new Superagent(config, reopened, recoveredMessenger, join(directory, "extension.ts"), () => {}, {
+        connect: async path => {
+          if (path === lane.socketPath) return retained;
+          if (path === headPaths.socketPath) return head;
+          throw new Error("Unexpected native owner");
+        },
+      });
+      const tracked = fixtures.find(entry => entry.runtime === runtime);
+      if (!tracked) throw new Error("Missing runtime fixture");
+      tracked.runtime = restarted;
+      await restarted.start();
+      await waitForOutput(recoveredMessenger, `${click.id}:head-control`);
+      await admit(restarted, click);
+      expect(reopened.input(click.id)?.state).toBe("done");
+      expect(reopened.lane(lane.id)?.model).toEqual(otherModel);
+      expect(recoveredMessenger.sent.filter(output => output.sourceId === click.id)).toMatchObject([{ route: lane.route }]);
+      expect(retained.commands.filter(command => command.type === "set_lane_model")).toEqual([]);
+      expect(retained.prompts).toEqual([]);
+      expect(head.prompts).toEqual([]);
+    },
+  );
+
   test("an unloaded explicit change commits a snapshot and receipt without launching or changing the main default", async () => {
     const { runtime, store, config, launched, main } = fixture();
     const lane = savedLane(store, config, "switch-unloaded", route("40"));
@@ -7452,6 +10164,59 @@ describe("explicit lane-local model changes", () => {
     expect(main.commands.some(command => command.type === "set_model")).toBe(false);
     expect(JSON.parse(store.getMeta(`lane-model:${lane.id}:receipt:${sourceId}`)!)).toMatchObject({ sourceId, previous: executionModel, model: otherModel, preset: null });
     expect(store.getMeta(`lane-model:${lane.id}:pending`)).toBe("");
+  });
+
+  test.each(["wake", "resume"] as const)("passive %s after restart cannot commit an interrupted unloaded owner selection", async action => {
+    const { runtime, store, config, launched, messenger, hosts } = fixture();
+    const lane = savedLane(store, config, `operator-unloaded-${action}`, route("40"));
+    if (action === "resume") store.updateLane(lane.id, lane.generation, { workState: "paused" });
+    const choice = message("operator-interrupted-unloaded", lane.route, "/model --lane fixture/efficient");
+    const reason = "Operator selected this model for the bound lane.";
+    // The prior controller durably admitted the command and saved its intent,
+    // then stopped before the transaction that commits the selection and receipt.
+    store.receive(choice, "main", { [`user-source:${choice.id}`]: "true" });
+    const requestId = `lane-model-${createHash("sha256").update(choice.id).digest("hex").slice(0, 24)}`;
+    expect(store.submit(choice.id, requestId, 0)).toBe(true);
+    const pendingKey = `lane-model:${lane.id}:pending`;
+    store.setMeta(pendingKey, JSON.stringify({
+      sourceId: choice.id, request: JSON.stringify([otherModel, null, reason]), generation: lane.generation,
+      previous: lane.model, observed: null, observedSettings: null, model: otherModel, reason, preset: null, snapshot: null,
+      native: false, operator: { route: routeKey(lane.route), sessionId: lane.sessionId,
+        previousPreset: lane.modelPreset, previousSnapshot: lane.modelPresetSnapshot },
+    }));
+    const oldIntent = store.getMeta(pendingKey);
+
+    await runtime.start();
+    await waitForOutput(messenger, `${choice.id}:head-control`);
+    expect(store.input(choice.id)?.state).toBe("cancelled");
+    await admit(runtime, choice); // Redelivery is not a fresh operator choice.
+    const followup = message("lane-wake-after-crash", lane.route, "Check a new invoice.");
+    if (action === "wake") {
+      await admit(runtime, followup);
+      expect(store.inputs(lane.id).map(input => input.state)).toEqual(["pending"]);
+    } else {
+      await expect(runtime.resume(lane.id)).rejects.toThrow("/model --lane");
+      expect(store.lane(lane.id)?.workState).toBe("paused");
+    }
+    expect(store.lane(lane.id)?.model).toEqual(executionModel);
+    expect(store.getMeta(pendingKey)).toBe(oldIntent);
+    expect(store.getMeta(`lane-model:${lane.id}:receipt:${choice.id}`)).toBeNull();
+    expect(launched).toEqual([]);
+
+    const fresh = message("operator-confirm-unloaded", lane.route, choice.text);
+    await admit(runtime, fresh);
+    expect(store.input(fresh.id)?.state).toBe("done");
+    expect(store.lane(lane.id)?.model).toEqual(otherModel);
+    if (action === "wake") {
+      const host = hosts.get(lane.socketPath);
+      if (!host) throw new Error("Fresh selection did not allow the queued work to wake");
+      expect(host.state.model).toEqual(otherModel);
+      expect(host.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(followup.text)]);
+    } else {
+      await runtime.resume(lane.id);
+      expect(store.lane(lane.id)?.workState).toBe("open");
+      expect(launched).toEqual([]);
+    }
   });
 
   test("an interrupted unloaded commit retries its durable store-only intent without launching a host", async () => {
@@ -7483,7 +10248,7 @@ describe("explicit lane-local model changes", () => {
     };
     const result = await runtime.changeModel({ id: lane.id, sourceId, model: otherModel, modelReason: "Explicitly switch this idle lane only." });
     expect(result).toMatchObject({ model: otherModel, state: { model: otherModel }, modelCheck: { expected: otherModel, actual: otherModel, error: null } });
-    expect(host.commands.filter(command => command.type === "set_model")).toEqual([{ type: "set_model", provider: otherModel.provider, modelId: otherModel.id }]);
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toEqual([{ type: "set_lane_model", provider: otherModel.provider, modelId: otherModel.id }]);
     expect(host.prompts).toEqual([]);
     expect(main.state.model).toEqual(executionModel);
     expect(store.lane(lane.id)?.generation).toBe(0);
@@ -7517,7 +10282,7 @@ describe("explicit lane-local model changes", () => {
       const sourceId = modelChangeSource(store, "change-busy");
       await expect(runtime.changeModel({ id: lane.id, sourceId, model: otherModel, modelReason: "Do not interrupt active work." })).rejects.toThrow("not natively idle");
       expect(host.state).toEqual(before);
-      expect(host.commands.some(command => command.type === "set_model" || command.type === "goal")).toBe(false);
+      expect(host.commands.some(command => command.type === "set_lane_model" || command.type === "goal")).toBe(false);
       expect(host.cancelled).toEqual([]);
       expect(store.getMeta(`lane-model:${lane.id}:pending`)).toBeNull();
     }
@@ -7534,7 +10299,7 @@ describe("explicit lane-local model changes", () => {
       store.submit("held-native-input", "unresolved-native-prompt", 0);
       if (uncertain) store.settle("held-native-input", "uncertain");
       await expect(runtime.changeModel({ id: lane.id, sourceId: modelChangeSource(store, "change-held"), model: otherModel, modelReason: "No uncertainty bypass." })).rejects.toThrow("submitted, uncertain");
-      expect(host.commands.some(command => command.type === "set_model")).toBe(false);
+      expect(host.commands.some(command => command.type === "set_lane_model")).toBe(false);
       expect(store.lane(lane.id)?.model).toEqual(executionModel);
     }
   });
@@ -7570,7 +10335,7 @@ describe("explicit lane-local model changes", () => {
     expect(host.state.model).toEqual(otherModel);
     expect(store.getMeta(`lane-model:${lane.id}:receipt:${sourceId}`)).toBeNull();
     expect(await runtime.changeModel(change)).toMatchObject({ model: otherModel, modelChange: null });
-    expect(host.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
   });
 
   test("an ambiguous unapplied change holds work and only an explicit same-source retry may apply it", async () => {
@@ -7585,13 +10350,13 @@ describe("explicit lane-local model changes", () => {
     await expect(runtime.changeModel(change)).rejects.toThrow("outcome unknown");
     await delegate(runtime, message("work-held-for-model", lane.route));
     expect(host.prompts).toEqual([]);
-    expect(host.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
     expect(await runtime.inspect(lane.id)).toMatchObject({ model: executionModel, modelChange: { sourceId }, modelCheck: { error: expect.stringContaining("durable intent") } });
     await expect(runtime.changeModel({ ...change, sourceId: modelChangeSource(store, "different-change-source") })).rejects.toThrow("unresolved model change");
     host.modelSetResult = "success";
     await runtime.changeModel(change);
     await runtime.kick();
-    expect(host.commands.filter(command => command.type === "set_model")).toHaveLength(2);
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toHaveLength(2);
     expect(host.prompts).toHaveLength(1);
   });
 
@@ -7658,7 +10423,7 @@ describe("explicit lane-local model changes", () => {
       if (offline) await restarted.resume(lane.id);
       expect(reopened.lane(lane.id)?.model).toEqual(otherModel);
       expect(JSON.parse(reopened.getMeta(`lane-model:${lane.id}:receipt:${sourceId}`)!)).toMatchObject({ sourceId, model: otherModel });
-      expect(restored.commands.some(command => command.type === "set_model")).toBe(false);
+      expect(restored.commands.some(command => command.type === "set_lane_model")).toBe(false);
       expect(restored.prompts).toEqual([]);
       expect(launched).toHaveLength(offline ? 1 : 0);
       if (offline) expect(launched[0]).not.toHaveProperty("model");
@@ -7690,7 +10455,7 @@ describe("explicit lane-local model changes", () => {
     const sourceId = modelChangeSource(store, "change-invalid");
     await expect(runtime.changeModel({ id: lane.id, sourceId, model: { provider: "fixture", id: "judge" }, modelReason: "No non-chat execution model." })).rejects.toThrow("not an available native chat model");
     expect(store.getMeta(`lane-model:${lane.id}:pending`)).toBeNull();
-    expect(host.commands.some(command => command.type === "set_model")).toBe(false);
+    expect(host.commands.some(command => command.type === "set_lane_model")).toBe(false);
   });
 
   test("model changes serialize per lane and fence pending dispatch during native effects", async () => {
@@ -7709,27 +10474,48 @@ describe("explicit lane-local model changes", () => {
     store.receive(message("serialized-work", lane.route), lane.id);
     await runtime.kick();
     expect(host.prompts).toEqual([]);
-    expect(host.commands.filter(command => command.type === "set_model")).toHaveLength(1);
+    expect(host.commands.filter(command => command.type === "set_lane_model")).toHaveLength(1);
     finish.resolve();
-    await Promise.all([first, second]);
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult).toMatchObject({ model: otherModel, state: { model: otherModel }, modelCheck: { error: null } });
+    expect(secondResult).toMatchObject({ model: executionModel, state: { model: executionModel }, modelCheck: { error: null } });
     expect(store.lane(lane.id)).toMatchObject({ model: executionModel, modelReason: "Second serialized change." });
-    expect(host.commands.filter(command => command.type === "set_model").map(command => command.modelId)).toEqual([otherModel.id, executionModel.id]);
+    expect(host.commands.filter(command => command.type === "set_lane_model").map(command => command.modelId)).toEqual([otherModel.id, executionModel.id]);
   });
 
-  test("an inspection awaiting catalog I/O cannot quarantine a newly committed same-generation switch", async () => {
+  test.each(["catalog", "captured lane state"] as const)("an inspection delayed at %s cannot quarantine a newly committed same-generation switch", async where => {
     const { runtime, store, config, hosts, main } = fixture();
     const lane = savedLane(store, config, "switch-inspect-race", route("55"), process.pid);
-    hosts.set(lane.socketPath, new HostTransport(lane.sessionFile, "session-switch-inspect-race"));
+    const host = new HostTransport(lane.sessionFile, "session-switch-inspect-race");
+    hosts.set(lane.socketPath, host);
     await runtime.start();
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    main.beforeCatalog = async () => { main.beforeCatalog = undefined; entered.resolve(); await release.promise; };
+    const pause = () => {
+      main.beforeCatalog = undefined;
+      host.afterState = undefined;
+      entered.resolve();
+      return release.promise;
+    };
+    if (where === "catalog") main.beforeCatalog = pause;
+    else host.afterState = pause;
     const inspecting = runtime.inspect(lane.id);
-    await entered.promise;
-    await runtime.changeModel({ id: lane.id, sourceId: modelChangeSource(store, "change-inspect-race"), model: otherModel, modelReason: "An authorized same-generation switch during readback." });
-    release.resolve();
-    expect(await inspecting).toMatchObject({ model: otherModel, modelCheck: { expected: otherModel, actual: otherModel, error: null } });
-    expect(store.lane(lane.id)?.runtimeState).toBe("idle");
+    try {
+      await Promise.race([entered.promise, inspecting.then(() => { throw new Error("Expected a delayed inspection"); })]);
+      await runtime.changeModel({ id: lane.id, sourceId: modelChangeSource(store, "change-inspect-race"),
+        model: otherModel, modelReason: "An authorized same-generation switch during readback." });
+    } finally {
+      release.resolve();
+    }
+    expect(await inspecting).toMatchObject({ model: otherModel, runtimeState: "idle", queueHolds: { runtimeBlocked: false },
+      modelCheck: { expected: otherModel, actual: otherModel, error: null } });
+
+    let dispatchedModel: RuntimeState["model"];
+    host.beforePrompt = () => { dispatchedModel = structuredClone(host.state.model); };
+    const followup = message("switch-inspect-next-work", lane.route, "Run the next check.");
+    await delegate(runtime, followup);
+    expect(host.prompts.map(prompt => prompt.command.message)).toEqual([expect.stringContaining(followup.text)]);
+    expect(dispatchedModel).toEqual(otherModel);
   });
 });
 
@@ -7850,7 +10636,7 @@ describe("authoritative per-lane model selection", () => {
     const host = hosts.get(lane.socketPath)!;
     expect(launched[0]?.model).toBe("fixture/capable");
     expect(host.prompts).toEqual([]);
-    expect(host.commands.some(command => command.type === "set_model")).toBe(false);
+    expect(host.commands.some(command => command.type === "set_lane_model")).toBe(false);
     expect(delegated(store, "2040")?.state).toBe("pending");
     expect(store.lane(lane.id)?.runtimeState).toBe("interrupted");
     expect(await runtime.inspect(lane.id)).toMatchObject({ modelCheck: { expected: executionModel, actual: otherModel, error: expect.stringContaining("model drift") } });
@@ -7873,7 +10659,7 @@ describe("authoritative per-lane model selection", () => {
     main.models = [otherModel];
     await expect(runtime.resume(lane.id)).rejects.toThrow("not an available native chat model");
     expect(host.prompts).toEqual([]);
-    expect(host.commands.some(command => command.type === "set_model")).toBe(false);
+    expect(host.commands.some(command => command.type === "set_lane_model")).toBe(false);
   });
 
   test("model readback after attachment transfer prevents dispatch after an operator change", async () => {
@@ -8050,6 +10836,11 @@ describe("authoritative per-lane model selection", () => {
     expect(notice.text).toContain("현재 모델: fixture/efficient");
     expect(notice.text).not.toContain("생성한");
     expect(notice.route).toEqual(lane.route);
+    const open = applicationCommand("11023", lane.route, "/model");
+    await admit(runtime, open);
+    const picker = store.output(`${open.id}:head-control`)?.picker;
+    if (picker?.kind !== "model" || !picker.modelTargets?.lane) throw new Error("Missing bound model menu");
+    expect(picker.modelTargets.lane.current).toBeUndefined();
   });
 
   test("an owned cold resume accepts the configured model without a reverse journal entry", async () => {
@@ -8071,6 +10862,7 @@ describe("authoritative per-lane model selection", () => {
     host.state.hostPid = exitedPid;
     recordedModelChanges(host, journal);
     hosts.set(lane.socketPath, host);
+    markMockHostEndpoint(host, lane.socketPath);
     mkdirSync(dirname(lane.sessionFile), { recursive: true });
     writeFileSync(lane.sessionFile, JSON.stringify({ type: "session", version: 3, id: host.state.sessionId, cwd: lane.cwd }) + "\n");
 
@@ -8363,6 +11155,12 @@ describe("frozen native preset lane choices", () => {
     expect(launched).toHaveLength(1);
     expect(launched[0]).toMatchObject({ model: "fixture/efficient", modelPreset: { name: "low", preset: snapshot } });
     expect(hosts.get(lane.socketPath)?.prompts).toEqual([]);
+
+    const direct = await runtime.changeModel({ id: lane.id, sourceId: modelChangeSource(store, "preset-offline-direct-change"),
+      model: executionModel, modelReason: "Select a direct model on the just-restored native owner." });
+    expect(direct).toMatchObject({ model: executionModel, modelPreset: null, runtimeState: "idle",
+      modelCheck: { expected: executionModel, actual: executionModel, error: null }, queueHolds: { runtimeBlocked: false } });
+    expect(await runtime.inspect(lane.id)).toMatchObject({ modelCheck: { error: null }, queueHolds: { runtimeBlocked: false } });
   });
 
   test("unloaded explicit changes restore the old transcript then journal the chosen model before dispatch", async () => {
@@ -8382,7 +11180,7 @@ describe("frozen native preset lane choices", () => {
     // The restored model is read back with a journal boundary before the
     // independent prompt admission cursor is acquired. No other mutation runs.
     expect(host.commands.map(command => command.type)).toEqual([
-      "set_model", "get_journal_cursor", "get_entries", "get_journal_cursor", "prompt",
+      "set_lane_model", "get_journal_cursor", "get_entries", "get_journal_cursor", "prompt",
     ]);
     expect(host.state.model).toEqual(otherModel);
     expect(store.getMeta(`lane-model:${lane.id}:apply`)).toBe("");
@@ -8434,7 +11232,7 @@ describe("frozen native preset lane choices", () => {
       await delegate(runtime, message("2240", lane.route));
       await expect(runtime.changeModel({ id: lane.id, sourceId: modelChangeSource(store, "unisolated-change"), model: otherModel, modelReason: "Never mutate persistent settings." })).rejects.toThrow("session-isolated");
       expect(host.prompts).toEqual([]);
-      expect(host.commands.some(command => command.type === "set_model" || command.type === "set_model_preset")).toBe(false);
+      expect(host.commands.some(command => command.type === "set_lane_model" || command.type === "set_model_preset")).toBe(false);
       expect(delegated(store, "2240")?.state).toBe("pending");
     }
   });
@@ -10483,7 +13281,7 @@ describe("real Store runtime coordination", () => {
     host.beforePrompt = () => { throw new Error("Native prompt acknowledgement was lost"); };
     await delegate(runtime, message("lost", lane.route));
     host.beforePrompt = undefined;
-    await delegate(runtime, message("later", lane.route));
+    await admit(runtime, message("later", lane.route));
     expect(delegated(store, "lost")?.state).toBe("uncertain");
 
     host.beforeState = () => { throw new Error("Native settlement read failed"); };
@@ -10504,7 +13302,9 @@ describe("real Store runtime coordination", () => {
       // Use a deadline only to keep a shared-pump regression from hanging teardown.
       const deadline = new Promise<never>((_, reject) => AbortSignal.timeout(1500).addEventListener("abort",
         () => reject(new Error("Unrelated lane dispatch waited for the failing Host"))));
-      await Promise.race([delegate(runtime, message("unrelated", other.route)), deadline]);
+      // This is new operator work in the sibling's own topic, not a manager
+      // tool call made by HEAD while it is handling the first lane's report.
+      await Promise.race([admit(runtime, message("unrelated", other.route)), deadline]);
       expect(otherHost.prompts.map(prompt => prompt.command.message)).toEqual([
         expect.stringContaining("Request ID: handoff:unrelated:healthy-sibling"),
       ]);

@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::picker::{ACCEPTED, CANCELLED, Change, EXPIRED, Menu};
+use crate::picker::{ACCEPTED, CANCELLED, Change, EXPIRED, Menu, ModelTarget};
 
 use super::model::{Interaction, Route, read, snowflake};
 use super::responses::Callback;
@@ -8,17 +8,36 @@ use super::rest::no_mentions;
 use super::{Effect, State};
 
 pub(super) fn components(menu: &Menu) -> Value {
-    let mut rows = Vec::with_capacity(2);
+    let mut rows = Vec::with_capacity(2 + usize::from(menu.target_select.is_some()));
+    if let Some(target) = &menu.target_select {
+        let mut options = vec![json!({
+            "label": "HEAD", "value": ModelTarget::Head, "default": target.selected == Some(ModelTarget::Head),
+        })];
+        if let Some(label) = &target.lane_label {
+            options.push(json!({
+                "label": label, "value": ModelTarget::Lane, "default": target.selected == Some(ModelTarget::Lane),
+            }));
+        }
+        rows.push(json!({
+            "type": 1,
+            "components": [{
+                "type": 3, "custom_id": target.control, "options": options,
+                "placeholder": "Choose a destination",
+            }],
+        }));
+    }
     if !menu.options.is_empty() {
         let options = menu
             .options
             .iter()
             .map(|item| json!({"label": item.label, "value": item.value}))
             .collect::<Vec<_>>();
-        rows.push(json!({
-            "type": 1,
-            "components": [{"type": 3, "custom_id": menu.select_id, "options": options}],
-        }));
+        let mut select = json!({"type": 3, "custom_id": menu.select_id, "options": options});
+        if menu.select_disabled {
+            select["disabled"] = json!(true);
+            select["placeholder"] = json!("Choose a destination first");
+        }
+        rows.push(json!({"type": 1, "components": [select]}));
     }
     let buttons = menu
         .buttons
@@ -80,7 +99,11 @@ impl State {
             Change::Cancel => self.edit_picker(interaction, CANCELLED, json!([])).await,
             Change::Select(selection) => {
                 self.ctx.admit_picker(&selection).await?;
-                self.edit_picker(interaction, ACCEPTED, json!([])).await
+                let accepted = match selection.target {
+                    Some(ModelTarget::Lane) => "Selection accepted. The lane result will appear in this conversation.",
+                    Some(ModelTarget::Head) | None => ACCEPTED,
+                };
+                self.edit_picker(interaction, accepted, json!([])).await
             }
         }
     }

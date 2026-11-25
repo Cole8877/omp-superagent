@@ -1,6 +1,6 @@
 # Execution and coordination
 
-[Architecture](../../DESIGN.md) · [Messaging and authority](messaging.md) · [Operations](../OPERATIONS.md)
+[Architecture](../../DESIGN.md) · [Messaging and authority](messaging.md) · [Operations](../OPERATIONS.en.md)
 
 ## Lane control
 
@@ -24,7 +24,7 @@ journal. An SSH disconnect is client detach, not cancellation, an exit receipt,
 or authority to reassign work. Open and attachment are separate from sending
 the first input. A pending or ambiguous launch must be reconciled on that
 worker, never retried on another machine. Remote PIDs and session paths are not
-local filesystem or board identities. See [worker enrollment](../../README.md#add-a-remote-worker).
+local filesystem or board identities. See [worker enrollment](../OPERATIONS.en.md#add-a-remote-worker).
 
 When several workers qualify, placement accounts for both reported free slots
 and head assignments waiting to start. Concurrent admissions reserve their
@@ -84,6 +84,76 @@ Ownership and outcome checks that need the full journal still read it. The
 runtime exposes observation timestamps and `ownerCurrent`, not a guarantee
 that a reported dependency is still live. Native children cannot use the
 manager, report as the lane, or access the board.
+
+### Bound-topic assignment scope review
+
+An existing assignment can conflict with a later explicit owner correction.
+Ordinary bound-topic requests and replies still stay in the lane. For a
+standalone original owner message in the active bound topic, the root lane
+may call `lane_report({status:"scope_review", sourceId})` **directly**, using
+the current original source ID. The arguments cannot contain a target,
+owner-text copy, or lane-authored explanation. A scope review is neither a
+progress report nor a manager handoff. It has only an identity receipt from
+the native tool result and appends no custom progress event.
+
+The controller requires a matched native execution start and successful end
+from the exact current root lane session, file, request and generation. It
+rejects eval, `xd://`, custom-only or replayed receipts and fails closed on
+steering ambiguity. It rechecks the authenticated original owner input and
+its current topic binding independently. Both the review and corrective
+prompt require a fresh Gateway check of the original messenger account; a
+stored allowlist alone is insufficient after reconnect. A newer owner
+message in the same topic takes precedence even if catch-up admitted the
+older physical message last. Review requires exact trimmed owner text with
+no detected credentials or excluded material, including quotes spanning
+lines. Ineligible text stays in the bound lane; its
+redacted or projected remainder cannot authorize a review. HEAD compares
+the eligible text against the existing assignment and receives no lane
+prose, quote, or attachment as part of the review.
+
+If the original text explicitly supersedes the conflicting scope, the only
+allowed dispatch is a direct `lane_message` to that same lane with its review
+ID as `sourceId` and the exact verified owner text as `text`, without a
+workflow or override. The controller may dispatch one fresh, deduplicated
+corrective input only after the original lane run and HEAD review both
+settle successfully. The correction applies only to that assignment, not to
+tool availability, native approvals, operator settings, or other work. It
+cannot replay denied or uncertain effects. The lane delivers the corrected
+outcome on the original thread; HEAD does not echo the request or add a
+second reply. If the correction is unsupported or unclear, HEAD gives one
+bounded reason or clarification there, without dispatching work.
+
+### Failed lane requests
+
+Confirmed provider quota exhaustion is an operator decision, not a recovery
+prompt. The controller sends one notice on the authorized reply route and holds
+new prompts on that lane until the operator selects a model in its bound topic
+with `/model --lane <provider/id>` or the current-lane option on Discord's
+`/model` card. If the model-change acknowledgement is lost, selecting the same
+provider and model on a fresh card in the original conversation can reconcile
+the pending change against the original session. A cold lane's subsequent
+native application does not replace the receipt for the operator's original
+choice. This does not change HEAD or replay the failed request. A transient
+HTTP 429 or model-capacity error alone is not evidence of
+exhausted account quota.
+
+Other native execution errors, including in topic-owned work, go to HEAD for
+recovery. Before forwarding a lost-response report, the controller checks the
+original attached session for an exact settled receipt. If HEAD was busy, it
+checks again before forwarding; if a settlement state read fails, the next
+wake retries the read, not the prompt. A verified result supersedes the obsolete
+report, including an informational report from an older session without a
+verified owner. Such a report cannot authorize corrective work. Neither a
+missing ACK nor a detached client authorizes resubmission.
+A failed run proven to have started no local or provider-executed tools can close
+as failed and permit HEAD to select an eligible fallback and send a fresh,
+scoped correction. Recovery authority comes from HEAD's active report, not a
+source ID supplied in a tool call. Cancellation of the original request or a
+newer operator model selection invalidates the report, even if the model was
+changed back. A correction keeps the original approval route. If a dialog is
+first seen after reconnect and cannot be tied to that request, it stays on the
+native Host rather than appearing in the lane thread. Uncertain effects stay
+fenced; the report does not authorize a replay or a move to another lane.
 
 ## Execution budget and Host lifecycle
 
@@ -262,8 +332,13 @@ together, prevent the same row from re-authorizing drift after recovery or
 owner replacement. The notice reports which model is selected, not which model
 generated an answer. Frozen preset lanes remain excluded. An authorized
 `lane_set_model` can change one eligible idle lane with durable intent and
-readback. `config.model` is a head launch default, not the lane default or a
-reason to overwrite a saved head's model on restart.
+returns that change's own readback. The managed Host fences ordinary lane
+model switches as maintenance and rechecks native activity before invoking
+the setter; a menu click cannot use an earlier idle observation to switch a
+lane that has since started work. If the selected model is already running as a
+temporary fallback, its presence in `get_state` is not proof that it will be
+restored as the lane's selected model. `config.model` is a head launch default,
+not the lane default or a reason to overwrite a saved head's model on restart.
 Managed Hosts use private settings overlays, with native session-scope
 readback. Legacy lanes without a recorded selection adopt their authoritative
 native model rather than assuming the current head default; only an unstarted
@@ -272,7 +347,9 @@ to recover a recorded session.
 This preserves existing native provider fallback and retry policy; it is not a
 guarantee about every lower-level provider request.
 
-`/model` and `/effort` target the shared head even when issued in a lane topic.
+Direct `/model <provider/id>` and `/effort` target the shared head even in a
+lane topic. Discord's `/model` card and the explicit `/model --lane` command
+can instead target the lane bound to that conversation.
 Read-only queries can run while busy; mutations require native idle and session
 scope, record intent and report the actual applied model/effort. A current
 owner's explicit natural-language request can use `head_set_model` after its
@@ -287,6 +364,45 @@ effort capabilities to construct menus. A selection is a new owner control on
 the original topic, not a model turn or native approval. The head validates
 the menu's session and generation before applying it, and an effort selection
 also requires the model for which the options were shown.
+
+## Owner-facing reply voice
+
+[SOUL](../../src/soul.ts) is an instance-wide presentation preference, not a
+role, workflow, or OMP profile. The default and the one saved override use
+bounded choices for presentational concept (plain, editorial, or mentoring),
+tone, register, detail, answer order, and emoji. The HEAD
+contract still defines its identity. The `soul_update` native tool checks the
+current root HEAD session and a fresh, explicit original owner request. The
+controller derives the supported combination from that exact message, not from
+model-supplied fields. A plain request already addressed to HEAD does not need
+a command or a SOUL keyword. Questions, one-off requests, quotes, edits,
+derived input, and restricted-group messages cannot authorize a change. The
+instance ledger owns the revision and readback. Choosing a concept does not
+change any other setting by implication or establish a new role.
+
+The controller supplies the current voice on new, eligible owner-facing
+HEAD turns (including synthesis from a normal lane report) and on direct
+topic-reply lane turns. It uses the admitted run's delivery scope, not message
+content or the current channel. A steer inherits the opening run's scope:
+joining an active manager handoff does not give the lane the reply voice.
+The private owned Host takes only the closed voice profile and renders a
+root-only, temporary system block. An opaque admission token is removed at
+the stock input boundary; neither token nor style enters the user history,
+lane brief, or global `PERSONALITY.md`. Native task children, internal control prompts,
+structured replies, and code-generated notices do not use it. Settings apply
+to the next eligible run on a capable resident Host, without reloading its
+session or changing SUPER activation. Hosts advertising reply voice v2 also
+receive the concept; v1 Hosts continue receiving the original style fields
+without the concept. Hosts with no capability continue unstyled.
+
+The prompt boundary was compared with [Cataly `d2cb7078`](https://github.com/vntrevx/Cataly/blob/d2cb7078033ccab27895515d4c566fe7ed4078de/extension/index.ts#L1274-L1295),
+[OpenClaw `6978b40e`](https://github.com/openclaw/openclaw/blob/6978b40e9d3812083064c97e24de00454d6bf868/docs/concepts/system-prompt.md#L166-L185),
+[Hermes `242315ce`](https://github.com/NousResearch/hermes-agent/blob/242315ce571cde721e717a544cf8ae6c343315cf/agent/system_prompt.py#L547-L553),
+and [Dori `3b5487df`](https://github.com/vntrevx/omp-dori/blob/3b5487df12540cdd428ebcf7455375d72921e2dc/skills/dori-mode/SKILL.md#L65-L74).
+These are design references, not prompt or code reuse. The stock OMP extension
+and RPC contract was inspected at [v19.1.1](https://github.com/can1357/oh-my-pi/commit/31ffee513f27a01bba7d4dfbe12bae239cdc646a);
+the installed Host advertises the optional bridge rather than inferring it
+from a CLI version.
 
 ## Workflow selection
 
@@ -407,7 +523,7 @@ discarding custom commands or enabling disabled extensions.
   jobs remain inspectable and removable; pending runs are cancelled rather
   than forwarded to a model, and queued shell output is not sent. Verify any
   previously started legacy run on its original host before resolving it.
-  See the [operator reference](../OPERATIONS.md#예약-작업-cron) for syntax and controls.
+  See the [operator reference](../OPERATIONS.en.md#scheduled-jobs-cron) for syntax and controls.
 - [Repository PR intake](../../src/cron-pr-intake.ts) is a typed cron job, not
   an executable prompt. Only original configured-owner Discord guild parent
   controls enroll a repository. Discovery pins the authenticated GitHub owner
@@ -429,7 +545,7 @@ discarding custom commands or enabling disabled extensions.
   effect checks the enrolled repository, original route and policy revision;
   higher stages require an explicit policy or a fresh SHA-bound owner command.
   An uncertain write permits read-only reconciliation, not resubmission. See [operator commands
-  and supported GitHub protections](../OPERATIONS.md#새-외부-pr-검토-cron-pr-add).
+  and supported GitHub protections](../OPERATIONS.en.md#reviewing-new-external-prs-cron-pr-add).
 - [PR watch](../../src/pr-watch.ts) reads only explicitly registered GitHub PRs
   through existing `gh` authentication and GETs. Establish a quiet baseline,
   then record changed observations and their cursor together. Work only while

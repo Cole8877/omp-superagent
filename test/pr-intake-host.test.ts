@@ -86,11 +86,15 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
     await fs.writeFile(resource, resourceContents, { mode: 0o600 });
     const config = JSON.stringify({ disabledProviders: nativeDisabledProviders, goal: { enabled: true } });
     await fs.writeFile(join(agent, "config.yml"), config, { mode: 0o600 });
-    await fs.writeFile(join(agent, "models.yml"), JSON.stringify({ providers: { "pr-review-fixture": {
-      api: "openai-completions", apiKey: "loopback-fixture", baseUrl: `${server.url.origin}/v1`,
-      models: [{ id: "local", name: "Local review", contextWindow: 32768, maxTokens: 4096,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
-    } } }), { mode: 0o600 });
+    const chat = (id: string) => ({ id, name: id, contextWindow: 32768, maxTokens: 4096,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+    const baseUrl = `${server.url.origin}/v1`;
+    await fs.writeFile(join(agent, "models.yml"), JSON.stringify({ providers: {
+      "pr-review-fixture": { api: "openai-completions", apiKey: "loopback-fixture", baseUrl, models: [chat("local"), chat("alternate")] },
+      "pr-review-unsupported": { api: "google-generative-ai", apiKey: "loopback-fixture", baseUrl, models: [chat("unsupported")] },
+      "pr-review-harness": { api: "openai-completions", apiKey: "loopback-fixture", baseUrl,
+        transport: "pi-native", models: [chat("native")] },
+    } }), { mode: 0o600 });
     await startHost(options);
     connection = await HostConnection.connectForActivity(options.socketPath);
     const initial = await connection.client.getState();
@@ -100,6 +104,19 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
     expect(await connection.request({ type: "prompt", message: "/reload" })).toMatchObject({ success: false, code: "pr_review_rpc_forbidden" });
     expect(await connection.request({ type: "prompt", message: `${PR_REVIEW_INPUT_PREFIX}${JSON.stringify({ patch: `@${resource}` })}` }))
       .toMatchObject({ success: false, code: "pr_review_rpc_forbidden" });
+    const previous = { previousProvider: "pr-review-fixture", previousModelId: "local" };
+    const replacement = { provider: "pr-review-fixture", modelId: "alternate" };
+    const choice = { type: "set_pr_review_model", ...previous, ...replacement };
+    expect(await connection.request({ type: "set_model", ...replacement }))
+      .toMatchObject({ success: false, code: "pr_review_rpc_forbidden" });
+    expect(await connection.request({ ...choice, role: "smol" }))
+      .toMatchObject({ success: false, code: "pr_review_rpc_forbidden" });
+    expect(await connection.request({ ...choice, previousModelId: "stale-model" })).toMatchObject({ success: false });
+    for (const blocked of [{ provider: "pr-review-unsupported", modelId: "unsupported" },
+      { provider: "pr-review-harness", modelId: "native" }]) {
+      expect(await connection.request({ ...choice, ...blocked })).toMatchObject({ success: false, error: "Native request failed" });
+    }
+    expect(await connection.client.getState()).toMatchObject({ model: { provider: previous.previousProvider, id: previous.previousModelId } });
     expect(wire).toHaveLength(0);
     await connection.close();
     connection = await HostConnection.connectForActivity(options.socketPath);
@@ -109,6 +126,11 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
       .toMatchObject({ status: "completed" });
     expect(await connection.request({ type: "get_journal_cursor" }))
       .toMatchObject({ success: true, data: { leafId: expect.any(String) } });
+    const beforeSelection = wire.length;
+    expect(await connection.request(choice)).toMatchObject({ success: true, data: { provider: replacement.provider, id: replacement.modelId } });
+    expect(wire).toHaveLength(beforeSelection);
+    await connection.assertPrReviewOnly(cwd);
+    expect(await connection.client.getState()).toMatchObject({ model: { id: replacement.modelId }, dumpTools: [] });
     expect(await connection.request({ type: "shutdown_host" })).toMatchObject({ success: true });
     await connection.exited;
     await waitForFixtureProcessExit([initial.hostPid, initial.adapterOwnerPid]);
@@ -118,15 +140,18 @@ nativeTest("static PR Host keeps stock inference tool-free after detach and jour
     connection = await HostConnection.connectForActivity(options.socketPath);
     const restored = await connection.client.getState();
     expect(restored.sessionId).toBe(initial.sessionId);
+    expect(restored.model?.id).toBe("alternate");
     await connection.assertPrReviewOnly(cwd);
     solicit = "bash";
     await review(connection, "pr-round-two", data("Second static review round."));
     solicit = "write";
     await review(connection, "pr-round-three", data("Third static review round."));
     expect(unsolicited).toEqual(["bash", "write"]);
-    expect(wire[0]?.model).toBe("local");
+    expect(beforeSelection).toBeGreaterThan(0);
+    expect(wire.length).toBeGreaterThan(beforeSelection);
     expect(wire.some(input => JSON.stringify(input.messages).includes("Second static review round."))).toBe(true);
-    for (const request of wire) {
+    for (const [index, request] of wire.entries()) {
+      expect(request.model).toBe(index < beforeSelection ? previous.previousModelId : replacement.modelId);
       expect(request.tools ?? []).toEqual([]);
       expect(JSON.stringify(request.messages)).not.toContain(resourceContents);
     }

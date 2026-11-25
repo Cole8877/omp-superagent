@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -35,6 +35,33 @@ pub(crate) struct Picker {
     current: Option<String>,
     current_provider: Option<String>,
     groups: Vec<Group>,
+    #[serde(default, deserialize_with = "present")]
+    model_targets: Option<ModelTargets>,
+}
+
+// The controller owns the saved lane generation/session checks. The Gateway
+// displays the lane from that same card and returns only the selected target.
+#[derive(Clone, Deserialize)]
+struct ModelTargets {
+    #[serde(default, deserialize_with = "present")]
+    lane: Option<ModelLane>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelLane {
+    id: String,
+    current: Option<String>,
+    current_provider: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    allowed_options: Option<Vec<Vec<usize>>>,
+}
+
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    // An omitted field is allowed; an explicit null is not a target spec.
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Deserialize)]
@@ -48,6 +75,14 @@ pub(crate) struct Menu {
     pub select_id: String,
     pub options: Vec<Item>,
     pub buttons: Vec<Item>,
+    pub target_select: Option<TargetSelect>,
+    pub select_disabled: bool,
+}
+
+pub(crate) struct TargetSelect {
+    pub control: String,
+    pub lane_label: Option<String>,
+    pub selected: Option<ModelTarget>,
 }
 
 pub(crate) struct Item {
@@ -72,6 +107,7 @@ pub(crate) struct Navigation {
 pub(crate) struct Selection {
     token: Uuid,
     pub event: Value,
+    pub target: Option<ModelTarget>,
 }
 
 pub(crate) struct Opening {
@@ -92,6 +128,7 @@ struct Entry {
 struct Screen {
     stage: Stage,
     revision: u32,
+    scope: ModelScope,
 }
 
 #[derive(Clone, Copy)]
@@ -100,9 +137,24 @@ enum Stage {
     ConfirmUsageReset { option: usize },
 }
 
+#[derive(Clone, Copy)]
+enum ModelScope {
+    Unscoped,
+    AwaitingTarget,
+    Selected(ModelTarget),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ModelTarget {
+    Head,
+    Lane,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     Pick(usize),
+    Target(ModelTarget),
     Previous,
     Next,
     Back,
@@ -142,6 +194,13 @@ impl Pickers {
         {
             return Ok(None);
         }
+        let scope = match (spec.kind, route["platform"].as_str(), &spec.model_targets) {
+            (Kind::Model, Some("discord"), Some(targets)) if targets.lane.is_some() => {
+                ModelScope::AwaitingTarget
+            }
+            (Kind::Model, Some("discord"), Some(_)) => ModelScope::Selected(ModelTarget::Head),
+            _ => ModelScope::Unscoped,
+        };
         let entry = Entry {
             token: Uuid::new_v4(),
             output_id: id.to_owned(),
@@ -157,6 +216,7 @@ impl Pickers {
                     page: 0,
                 },
                 revision: 0,
+                scope,
             },
         };
         Ok(entry.view(entry.screen).map(|menu| Opening { menu, entry }))
@@ -201,6 +261,13 @@ impl Pickers {
         if card.navigating || revision != entry.screen.revision || !matches(&entry.route, &card.message_id) {
             return Ok(None);
         }
+        if !matches!(entry.screen.scope, ModelScope::Unscoped)
+            && matches!(action, Action::Pick(_))
+            && value.is_none()
+        {
+            // Scoped cards never advertise the numeric button IDs used by Telegram.
+            return Ok(None);
+        }
         if let Some((original, selection)) = &card.selection {
             // Only the exact same durable event may be retried after an
             // unconfirmed SQLite write. A second choice cannot replace it.
@@ -210,41 +277,76 @@ impl Pickers {
             cards.remove(&token);
             return Ok(Some(Change::Cancel));
         }
-        let stage = match entry.screen.stage {
-            Stage::Browse { group, page } => {
-                let Some(count) = entry.count(group) else {
+        let mut scope = entry.screen.scope;
+        let stage = match (entry.screen.stage, action) {
+            (stage, Action::Target(target)) => {
+                let has_lane = entry.picker.model_targets.as_ref().is_some_and(|targets| targets.lane.is_some());
+                if matches!(scope, ModelScope::Unscoped) || target == ModelTarget::Lane && !has_lane {
+                    return Ok(None);
+                }
+                let next_scope = ModelScope::Selected(target);
+                let catalogue_changed =
+                    entry.lane_options(scope).is_some() != entry.lane_options(next_scope).is_some();
+                scope = next_scope;
+                if catalogue_changed {
+                    Stage::Browse { group: None, page: 0 }
+                } else {
+                    stage
+                }
+            }
+            (Stage::Browse { group, page }, action) => {
+                let Some(indices) = entry.indices(scope, group) else {
                     return Ok(None);
                 };
                 match action {
                     Action::Previous if page > 0 => Stage::Browse { group, page: page - 1 },
-                    Action::Next if page < count.div_ceil(PAGE).saturating_sub(1) => {
+                    Action::Next => {
+                        if page >= indices.count().div_ceil(PAGE).saturating_sub(1) {
+                            return Ok(None);
+                        }
                         Stage::Browse { group, page: page + 1 }
                     }
                     Action::Back if entry.picker.kind == Kind::Model && group.is_some() => {
-                        Stage::Browse { group: None, page: group.unwrap_or_default() / PAGE }
+                        let Some(rank) = entry.indices(scope, None).and_then(|mut providers| {
+                            providers.position(|index| Some(index) == group)
+                        }) else {
+                            return Ok(None);
+                        };
+                        Stage::Browse { group: None, page: rank / PAGE }
                     }
-                    Action::Pick(index) if index < count && index / PAGE == page => {
+                    Action::Pick(index) => {
+                        if !indices
+                            .skip(page.saturating_mul(PAGE))
+                            .take(PAGE)
+                            .any(|shown| shown == index)
+                        {
+                            return Ok(None);
+                        }
                         match (entry.picker.kind, group) {
                             (Kind::UsageReset, Some(0)) => Stage::ConfirmUsageReset { option: index },
                             (Kind::Model | Kind::Effort, Some(group)) => {
-                                return Ok(Some(card.select(action, group, index, current)));
+                                let target = match scope {
+                                    ModelScope::Unscoped => None,
+                                    ModelScope::AwaitingTarget => return Ok(None),
+                                    ModelScope::Selected(target) => Some(target),
+                                };
+                                return Ok(Some(card.select(action, group, index, current, target)));
                             }
                             (Kind::Model, None) => Stage::Browse { group: Some(index), page: 0 },
                             (Kind::UsageReset, _) | (Kind::Effort, None) => return Ok(None),
                         }
                     }
                     Action::Previous
-                    | Action::Next
                     | Action::Back
-                    | Action::Pick(_)
+                    | Action::Target(_)
                     | Action::Confirm
                     | Action::Cancel => return Ok(None),
                 }
             }
-            Stage::ConfirmUsageReset { option } => match action {
+            (Stage::ConfirmUsageReset { option }, action) => match action {
                 Action::Back => Stage::Browse { group: Some(0), page: option / PAGE },
-                Action::Confirm => return Ok(Some(card.select(action, 0, option, current))),
-                Action::Previous | Action::Next | Action::Pick(_) | Action::Cancel => {
+                Action::Confirm => return Ok(Some(card.select(action, 0, option, current, None))),
+                Action::Previous | Action::Next | Action::Pick(_) | Action::Target(_) | Action::Cancel => {
                     return Ok(None);
                 }
             },
@@ -252,7 +354,7 @@ impl Pickers {
         let Some(revision) = revision.checked_add(1) else {
             return Ok(None);
         };
-        let next = Screen { stage, revision };
+        let next = Screen { stage, revision, scope };
         Ok(entry.view(next).map(|menu| {
             card.navigating = true;
             Change::Show(Navigation { token, next, menu })
@@ -282,7 +384,14 @@ impl Pickers {
 }
 
 impl Card {
-    fn select(&mut self, action: Action, group: usize, option: usize, current: i64) -> Change {
+    fn select(
+        &mut self,
+        action: Action,
+        group: usize,
+        option: usize,
+        current: i64,
+        target: Option<ModelTarget>,
+    ) -> Change {
         let entry = &self.entry;
         let mut selected = json!({
             "outputId": entry.output_id, "cardId": self.message_id,
@@ -290,6 +399,9 @@ impl Card {
         });
         if action == Action::Confirm {
             selected["confirmed"] = json!(true);
+        }
+        if let Some(target) = target {
+            selected["target"] = json!(target);
         }
         let event = json!({"kind": "message", "input": {
             "id": format!("picker:{}", entry.output_id),
@@ -300,18 +412,57 @@ impl Card {
             "text": "",
             "pickerSelection": selected
         }});
-        let selection = Selection { token: entry.token, event };
+        let selection = Selection { token: entry.token, event, target };
         self.selection = Some((action, selection.clone()));
         Change::Select(selection)
     }
 }
 
 impl Entry {
-    fn count(&self, group: Option<usize>) -> Option<usize> {
-        match group {
-            None => Some(self.picker.groups.len()),
-            Some(group) => Some(self.picker.groups.get(group)?.options.len()),
+    fn lane_options(&self, scope: ModelScope) -> Option<&[Vec<usize>]> {
+        match scope {
+            ModelScope::Selected(ModelTarget::Lane) => self
+                .picker
+                .model_targets
+                .as_ref()?
+                .lane
+                .as_ref()?
+                .allowed_options
+                .as_deref(),
+            ModelScope::Unscoped
+            | ModelScope::AwaitingTarget
+            | ModelScope::Selected(ModelTarget::Head) => None,
         }
+    }
+
+    // Pagination counts visible entries, but a choice always uses the original
+    // HEAD catalogue coordinates, including gaps left by the lane filter.
+    fn indices(
+        &self,
+        scope: ModelScope,
+        group: Option<usize>,
+    ) -> Option<impl Iterator<Item = usize> + Clone + '_> {
+        let end = match group {
+            Some(group) => self.picker.groups.get(group)?.options.len(),
+            None => self.picker.groups.len(),
+        };
+        let lane_options = self.lane_options(scope);
+        Some((0..end).filter(move |&index| {
+            let Some(lane_options) = lane_options else {
+                return true;
+            };
+            match group {
+                Some(group) => lane_options
+                    .get(group)
+                    .is_some_and(|options| options.contains(&index)),
+                None => lane_options
+                    .get(index)
+                    .zip(self.picker.groups.get(index))
+                    .is_some_and(|(allowed, group)| {
+                        allowed.iter().any(|&option| option < group.options.len())
+                    }),
+            }
+        }))
     }
 }
 
@@ -321,6 +472,8 @@ fn parse(control: &str, value: Option<&str>) -> Option<(Uuid, u32, Action)> {
     let token = Uuid::try_parse(id).ok()?;
     let action = match (action, value) {
         ("s", Some(index)) => Action::Pick(number(index)?),
+        ("t", Some("head")) => Action::Target(ModelTarget::Head),
+        ("t", Some("lane")) => Action::Target(ModelTarget::Lane),
         ("s", None) | (_, Some(_)) => return None,
         ("p", None) => Action::Previous,
         ("n", None) => Action::Next,

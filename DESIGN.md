@@ -19,7 +19,7 @@ or lanes. This is not a multitenant service or an OS sandbox.
   approvals, recovery, delivery, and Discord voice.
 - [Execution and coordination](docs/design/execution.md): lanes, native Host lifecycle,
   models, workflows, managed integration, monitoring, and the board.
-- [Setup and operations](docs/OPERATIONS.md): configuration, commands, and recovery procedures.
+- Setup and operations ([English](docs/OPERATIONS.en.md) · [한국어](docs/OPERATIONS.md)): configuration, commands, and recovery procedures.
 - [Versioned release records](docs/releases/): dated evidence and its limits.
 
 <picture>
@@ -161,9 +161,9 @@ lifecycle control, not a model turn. It can be admitted while the head is busy:
   keeps intake held; a configured default is not evidence of active effort.
   Reconnect to resident lanes within the Host budget only when ownership and
   generation match. Leave out-of-budget Hosts untouched and unloaded lanes unloaded.
-  A local lane counts against the budget only while its recorded PID is alive or its
-  socket exists; an exited Host with no socket is the same verified exit a release
-  accepts, so its stale PID does not hold a slot.
+  A detached local lane's recorded residency is retired only after its exact owner
+  PID no longer exists and its socket path is confirmed absent. That releases its
+  slot without changing paused work, queue order or unresolved approvals.
   Restore native admission and outcomes from matching journal evidence, not receipts
   from another run. Held submissions are not replayed. Only a goal active before the
   restart with a verified original source can resume through native goal resume;
@@ -187,7 +187,7 @@ runtime wrapper in place of the native CLI.
 [CI](https://github.com/dbc-hbin/omp-superagent/actions/workflows/ci.yml)
 uses the SDK-matched official CLI for the baseline tests on Linux x64 and macOS
 ARM64. Separate jobs build and verify installation of the npm payload on Linux
-and macOS on both architectures; see the [packaging procedure](docs/OPERATIONS.md#소스npm-릴리즈).
+and macOS on both architectures; see the [packaging procedure](docs/OPERATIONS.en.md#source-and-npm-releases).
 OMP 18 can still be tested locally with `bash scripts/test-omp.sh <release-tag>`.
 `bun run test:ci` uses the installed
 CLI; `bun run test:baseline` downloads and verifies the SDK-matched official binary.

@@ -1,4 +1,4 @@
-use super::{Entry, Item, Kind, Menu, PAGE, PREFIX, Screen, Stage};
+use super::{Entry, Item, Kind, Menu, ModelScope, ModelTarget, PAGE, PREFIX, Screen, Stage, TargetSelect};
 
 const LABEL_LIMIT: usize = 68; // Slack plain_text has a 75-character limit.
 const TEXT_LIMIT: usize = 2_000; // Discord component-message content limit.
@@ -26,14 +26,39 @@ impl Entry {
                         button("b", "Back"),
                         button("x", "Cancel"),
                     ],
+                    target_select: None,
+                    select_disabled: false,
                 });
             }
         };
-        let count = self.count(group)?;
-        if count == 0 {
+        let indices = self.indices(screen.scope, group)?;
+        let count = indices.clone().count();
+        if count == 0 && self.lane_options(screen.scope).is_none() {
             return None;
         }
         let group = group.and_then(|index| self.picker.groups.get(index));
+        let lane = self.picker.model_targets.as_ref().and_then(|targets| targets.lane.as_ref());
+        let target_select = match screen.scope {
+            ModelScope::Unscoped => None,
+            ModelScope::AwaitingTarget | ModelScope::Selected(_) => Some(TargetSelect {
+                control: control("t"),
+                lane_label: lane.map(|lane| shorten(&format!("Lane: {}", lane.id), LABEL_LIMIT)),
+                selected: match screen.scope {
+                    ModelScope::Selected(target) => Some(target),
+                    ModelScope::Unscoped | ModelScope::AwaitingTarget => None,
+                },
+            }),
+        };
+        let (current, current_provider) = match screen.scope {
+            ModelScope::Unscoped | ModelScope::Selected(ModelTarget::Head) => {
+                (self.picker.current.as_ref(), self.picker.current_provider.as_deref())
+            }
+            ModelScope::AwaitingTarget => (None, None),
+            ModelScope::Selected(ModelTarget::Lane) => {
+                let lane = lane?;
+                (lane.current.as_ref(), lane.current_provider.as_deref())
+            }
+        };
         let title = match (self.picker.kind, group) {
             (Kind::Effort, _) => "Choose thinking effort".to_owned(),
             (Kind::UsageReset, _) => "Choose an account for a usage reset".to_owned(),
@@ -42,11 +67,8 @@ impl Entry {
             }
             (Kind::Model, None) => "Choose a model provider".to_owned(),
         };
-        let first = page.saturating_mul(PAGE);
         let mut options = Vec::with_capacity(PAGE);
-        for index in first..count.min(first.saturating_add(PAGE)) {
-            let current = self.picker.current.as_ref();
-            let current_provider = self.picker.current_provider.as_deref();
+        for index in indices.skip(page.saturating_mul(PAGE)).take(PAGE) {
             let (label, is_current) = match group {
                 Some(group) => {
                     let label = group.options.get(index)?;
@@ -83,12 +105,27 @@ impl Entry {
             buttons.push(button("b", "Back"));
         }
         buttons.push(button("x", "Cancel"));
-        let footer = format!("\n\n{title} · page {}/{pages}", page + 1);
+        let mut footer = if count == 0 {
+            "\n\nNo compatible models are available for this lane. Select HEAD to browse its catalogue.".to_owned()
+        } else {
+            format!("\n\n{title} · page {}/{pages}", page + 1)
+        };
+        if let Some(target) = &target_select {
+            let label = match target.selected {
+                Some(ModelTarget::Head) => "HEAD",
+                Some(ModelTarget::Lane) => target.lane_label.as_deref()?,
+                None => "Choose HEAD or the bound lane before selecting a model",
+            };
+            footer.push_str("\nDestination: ");
+            footer.push_str(label);
+        }
         Some(Menu {
             text: self.with_footer(&footer)?,
             select_id: control("s"),
             options,
             buttons,
+            target_select,
+            select_disabled: group.is_some() && matches!(screen.scope, ModelScope::AwaitingTarget),
         })
     }
 

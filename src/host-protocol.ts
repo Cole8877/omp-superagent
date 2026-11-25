@@ -15,6 +15,7 @@ export const PR_REVIEW_SYSTEM_PROMPT = [
   'Otherwise use {"verdict":"blocked","summary":"findings or missing evidence"}.',
 ].join("\n");
 export const PR_REVIEW_GITHUB_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] as const;
+export const LANE_MODEL_PROMOTION_RECEIPT = "superagent_lane_model_promotion";
 
 /** Private adapter observations, not additions to the stock RPC protocol. */
 export type HostState = RpcSessionState & {
@@ -24,6 +25,7 @@ export type HostState = RpcSessionState & {
   readonly loadedSuperkitPath?: string;
   readonly prReviewPolicy?: { readonly version: 1; readonly cwd: string; readonly modelApi: string };
   readonly journalCursorVersion?: 1;
+  readonly replyVoiceVersion?: 1 | 2;
   settingsScope: "session";
   modelSettings: LanePresetSnapshot;
   hasOwnedRunningWork: boolean;
@@ -37,7 +39,10 @@ export type ServiceUnit = Pick<UnitSnapshot, "id" | "key" | "owner" |
   };
 export type Response = Frame & { success: boolean; data?: unknown; error?: string };
 export type HostResponse = RpcResponse | {
-  type: "response"; id?: string; command: "shutdown_host" | "set_model_preset" | "get_host_admission"; success: true; data: Frame;
+  type: "response"; id?: string; command: "shutdown_host" | "set_model_preset" | "set_pr_review_model" | "get_host_admission"; success: true; data: Frame;
+} | {
+  type: "response"; id?: string; command: "set_lane_model"; success: true;
+  data: { readonly provider: string; readonly id: string };
 } | {
   type: "response"; id?: string; command: "set_host_message_updates"; success: true;
   data: { readonly messageUpdates: "full" | "activity-v1" };

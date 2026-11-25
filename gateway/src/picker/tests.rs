@@ -61,6 +61,45 @@ fn unconfirmed_admission_reconciles_only_the_original_selection() -> Result<(), 
     Ok(())
 }
 
+#[test]
+fn unconfirmed_model_admission_cannot_switch_the_frozen_target() -> Result<(), EffectError> {
+    let pickers = Pickers::default();
+    let route = json!({"platform":"discord"});
+    let spec: Picker = serde_json::from_value(json!({
+        "kind":"model", "expiresAt":time()? + 60_000,
+        "current":"local/model", "currentProvider":"local",
+        "modelTargets":{"lane":{"id":"lane-browser","generation":3,"sessionId":null}},
+        "groups":[{"label":"local","options":["local/model"]}]
+    })).map_err(|_| ledger_error())?;
+    let opening = pickers.open("output", route.clone(), "Status", &spec)?.ok_or_else(ledger_error)?;
+    let target = opening.menu.target_select.as_ref().ok_or_else(ledger_error)?.control.clone();
+    pickers.posted(opening, "card".to_owned())?;
+    let choose = |control: &str, value: &str| {
+        pickers.choose(control, Some(value), |original, id| original == &route && id == "card")
+    };
+    let Some(Change::Show(provider)) = choose(&target, "lane")? else {
+        panic!("choosing lane should only display the next revision");
+    };
+    pickers.navigated(&provider, &Ok(()))?;
+    assert_eq!(provider.menu.options[0].label, "local", "unknown lane model must not mark HEAD");
+    let Some(Change::Show(models)) = choose(&provider.menu.select_id, "0")? else {
+        panic!("a provider choice should not admit a model change");
+    };
+    pickers.navigated(&models, &Ok(()))?;
+    assert_eq!(models.menu.options[0].label, "local/model", "HEAD is not the lane's current model");
+    let Some(Change::Select(frozen)) = choose(&models.menu.select_id, "0")? else {
+        panic!("a current model choice with a selected target must be ready for admission");
+    };
+    assert_eq!(frozen.event["input"]["pickerSelection"]["target"], "lane");
+    let target = &models.menu.target_select.as_ref().ok_or_else(ledger_error)?.control;
+    assert!(choose(target, "head")?.is_none());
+    let Some(Change::Select(replay)) = choose(&models.menu.select_id, "0")? else {
+        panic!("the exact selection can reconcile after an unconfirmed write");
+    };
+    assert_eq!(replay.event, frozen.event);
+    Ok(())
+}
+
 fn reset_fixture() -> Result<(Pickers, super::Opening), EffectError> {
     let pickers = Pickers::default();
     let spec: Picker = serde_json::from_value(json!({

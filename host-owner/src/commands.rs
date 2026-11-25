@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, watch};
 
 use crate::{
-    owner::{Barrier, GoalResume, Operation, Owner, data},
+    owner::{Barrier, GoalResume, Operation, Owner, ReplyVoice, data},
     projection::MessageUpdates,
     transport::{Channel, Error, LONG_TIMEOUT, Result, new_id},
     worker_rpc,
@@ -15,6 +15,7 @@ struct Command {
     frame: Value,
     id: String,
     name: String,
+    reply_voice: Option<Value>,
 }
 
 impl Command {
@@ -91,7 +92,12 @@ pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<
         .ok_or(Error::Unavailable("Invalid Host command"))?
         .to_owned();
     let id = frame["id"].as_str().map_or_else(new_id, str::to_owned);
-    let mut command = Command { frame, id, name };
+    let mut command = Command {
+        frame,
+        id,
+        name,
+        reply_voice: None,
+    };
     let worker = owner.is_worker();
     if worker && !worker_rpc::allows(&command.name, &command.frame) {
         return command.worker_refusal(peer);
@@ -105,7 +111,42 @@ pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<
             }),
         );
     }
+    if let Some(fields) = command.frame.as_object_mut()
+        && fields.contains_key("replyVoice")
+    {
+        if !worker_rpc::reply_voice(&command.name, fields) || !owner.supports_reply_voice() {
+            return command.respond(
+                peer,
+                json!({"success": false, "error": "Reply voice requires a supported initial prompt"}),
+            );
+        }
+        command.reply_voice = fields.remove("replyVoice");
+    }
+    if command.name == "set_pr_review_model" && !owner.pr_review_only() {
+        return command.respond(
+            peer,
+            json!({"success": false, "error": "Static PR review Host required"}),
+        );
+    }
+    if !worker
+        && command.name == "set_lane_model"
+        && !worker_rpc::lane_model_selection(&command.frame)
+    {
+        return command.respond(
+            peer,
+            json!({"success": false, "error": "An exact provider and modelId are required"}),
+        );
+    }
     let mut state = owner.state()?;
+    if command.reply_voice.as_ref().is_some_and(|voice| {
+        state.reply_voice_control.is_none()
+            || state.reply_voice_control == Some(1) && voice.get("concept").is_some()
+    }) {
+        return command.respond(
+            peer,
+            json!({"success": false, "error": "Native reply voice is unavailable"}),
+        );
+    }
     match command.name.as_str() {
         "extension_ui_response" => {
             if let Some(index) = state
@@ -187,8 +228,14 @@ pub(crate) fn admit(owner: &Arc<Owner>, frame: Value, peer: &Channel) -> Result<
         state.generation = state.generation.checked_add(1).ok_or(Error::Unavailable(
             "Host admission generation is unavailable",
         ))?;
+        if command.interrupt() {
+            owner.clear_reply_voice(&mut state, None)?;
+        }
     }
-    if matches!(command.name.as_str(), "shutdown_host" | "set_model_preset") {
+    if matches!(
+        command.name.as_str(),
+        "shutdown_host" | "set_model_preset" | "set_pr_review_model" | "set_lane_model"
+    ) {
         if state.maintenance_active || state.active_commands != 0 || !state.requests.is_empty() {
             return command.respond(peer, busy("Host is busy (session_busy)"));
         }
@@ -317,6 +364,14 @@ fn allows_pr_review(command: &Command) -> bool {
         "get_session_stats" => command.frame.as_object().is_some_and(|fields| {
             fields.keys().all(|key| matches!(key.as_str(), "id" | "type"))
         }),
+        // A separate private SDK control validates the native candidate and
+        // the tool-free guard before changing this session. Never forward the
+        // stock set_model command or caller-supplied settings to a review.
+        "set_pr_review_model" => command.frame.as_object().is_some_and(|fields| {
+            let selectors = ["provider", "modelId", "previousProvider", "previousModelId"];
+            fields.keys().all(|key| matches!(key.as_str(), "id" | "type") || selectors.contains(&key.as_str()))
+                && selectors.iter().all(|key| worker_rpc::model_id(&command.frame[*key]))
+        }),
         "negotiate_protocol"
         | "set_host_message_updates"
         | "get_host_admission"
@@ -413,6 +468,9 @@ async fn maintenance(owner: &Owner, command: &mut Command, peer: &Channel) -> Re
         return Ok(());
     }
     let control = owner.control()?;
+    let requested_model = (command.name == "set_lane_model").then(|| {
+        json!({"provider": command.frame["provider"], "id": command.frame["modelId"]})
+    });
     let mut response = control.request(std::mem::take(&mut command.frame)).await?;
     let success = response["success"].as_bool().ok_or(Error::Disconnected)?;
     if !success {
@@ -421,6 +479,20 @@ async fn maintenance(owner: &Owner, command: &mut Command, peer: &Channel) -> Re
             owner.state()?.unresolved_effect = true;
         }
         sanitize_private_error(&mut response);
+    }
+    if let Some(model) = requested_model {
+        response = if success {
+            if response["data"]["provider"] != model["provider"]
+                || response["data"]["id"] != model["id"]
+            {
+                return Err(Error::Disconnected);
+            }
+            json!({"success": true, "data": model})
+        } else if response["error"] == "session_busy" {
+            busy("Host is busy (session_busy)")
+        } else {
+            json!({"success": false, "error": "Native request failed"})
+        };
     }
     if command.respond(peer, response).is_err() {
         peer.close();
@@ -547,20 +619,87 @@ async fn execute(
     } else {
         None
     };
-    if !admitted.read_only {
-        owner
-            .state()?
-            .requests
-            .insert(id.clone(), command.id.clone());
+    // Stage at most one voice per native run. The stock-only marker correlates
+    // the exact input even when other RPC commands are already awaiting replies.
+    let stage = {
+        let mut state = owner.state()?;
+        if let Some(voice) = command.reply_voice.take()
+            && state.requests.is_empty()
+            && state.reply_voice.is_none()
+        {
+            state.reply_voice = Some(ReplyVoice {
+                id: id.clone(),
+                claimable: true,
+            });
+            Some(voice)
+        } else {
+            None
+        }
+    };
+    let mut staged = false;
+    if let Some(voice) = stage {
+        let response = owner
+            .control()?
+            .request(json!({
+                "type": "stage_reply_voice", "token": id, "message": command.frame["message"], "voice": voice,
+            }))
+            .await;
+        match response {
+            Ok(response) if response["success"] == true && response["data"]["staged"] == true => {
+                staged = true;
+            }
+            Ok(response) if response["success"] == true && response["data"]["staged"] == false => {
+                owner.state()?.reply_voice.take_if(|voice| voice.id == id);
+            }
+            _ => {
+                let mut state = owner.state()?;
+                owner.clear_reply_voice(&mut state, Some(&id))?;
+                return Err(Error::Unavailable("Native reply voice staging failed before submission"));
+            }
+        }
     }
     let wait = (command.name != "compact").then_some(LONG_TIMEOUT);
-    let request = owner
-        .native
-        .begin_request(std::mem::take(&mut command.frame), &id)?;
-    // FIFO admission for input sharing a serial predecessor, without waiting
-    // for the native response (which would serialize streaming input).
+    let request = {
+        let mut state = owner.state()?;
+        // A priority interrupt can cross the private staging ACK. Check the
+        // same admission epoch again and hold it through enqueueing on stock stdin.
+        if command.input()
+            && !command.interrupt()
+            && (state.generation != order.generation || state.fenced() || (staged && peer.is_closed()))
+        {
+            owner.clear_reply_voice(&mut state, Some(&id))?;
+            return Err(Error::Unavailable("Input cancelled before native admission"));
+        }
+        if !admitted.read_only {
+            state.requests.insert(id.clone(), command.id.clone());
+        }
+        if staged && let Some(message) = command.frame["message"].as_str() {
+            // The root extension removes this exact token before any other
+            // input handler, command, transcript or provider can see it.
+            command.frame["message"] = json!(format!("\0omp-superagent-reply-voice:{id}\n{message}"));
+        }
+        let result = owner.native.begin_request(std::mem::take(&mut command.frame), &id);
+        if result.is_err() {
+            owner.clear_reply_voice(&mut state, Some(&id))?;
+        }
+        result?
+    };
+    // Reads and subsequent commands retain their original stock write order.
     drop(order.dispatch_done);
-    let mut response = request.response(wait).await?;
+    let response = request.response(wait).await;
+    if staged {
+        let mut state = owner.state()?;
+        if !response.as_ref().is_ok_and(|response| {
+            response["success"] == true && response["data"]["agentInvoked"] != false
+        }) || state
+            .reply_voice
+            .as_ref()
+            .is_some_and(|voice| voice.id == id && voice.claimable)
+        {
+            owner.clear_reply_voice(&mut state, Some(&id))?;
+        }
+    }
+    let mut response = response?;
     if restore_queue && response["success"] == true {
         let fitted = if let Some(restored) = &restored {
             fit(owner, peer, &command.id, restored, &response["data"]).await
