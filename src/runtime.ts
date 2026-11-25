@@ -5677,13 +5677,15 @@ export class Superagent {
     if (this.store.getMeta(`head:restart:${input.id}`)) return false;
     const prior = this.restartFence();
     const live = this.live.get("main");
-    // Only a *new* owner command can supersede a completed checkpoint whose
-    // final idle readback was negative. Never repeat an ambiguous handoff.
-    const blockedCheckpoint = prior?.state === "checkpoint-blocked" && !this.restartActive
+    // Only a *new* owner command can supersede a restart that stopped before
+    // handoff: a checkpoint whose final idle readback was negative, or one that
+    // failed before any Gateway receipt. Never repeat an ambiguous handoff.
+    const supersedable = (prior?.state === "checkpoint-blocked" || prior?.state === "failed") && !this.restartActive
       && prior.ownerPid === process.pid && prior.sessionId === live?.sessionId
       && prior.stopBoundary === this.store.getMeta("gateway:operator-stop")
-      && !this.store.getMeta(`gateway:restart:${prior.requestId}`) ? prior.checkpoint : undefined;
-    if (command.argument || !this.adapters.requestRestart || prior && !blockedCheckpoint) {
+      && !this.store.getMeta(`gateway:restart:${prior.requestId}`);
+    const blockedCheckpoint = supersedable ? prior?.checkpoint : undefined;
+    if (command.argument || !this.adapters.requestRestart || prior && !supersedable) {
       this.controlReply(input, `Gateway AND HEAD restart refused. ${command.argument ? "Use /restart with no arguments."
         : !this.adapters.requestRestart ? "The managed Gateway restart transport is unavailable." : "An earlier restart is still held; inspect its original checkpoint/lifecycle receipt."} No process was stopped.`, "cancelled");
       return false;
@@ -5905,7 +5907,7 @@ export class Superagent {
       } else {
         if (this.restartFence()?.requestId !== restart.requestId) return;
         this.saveRestart({ ...restart, state: "failed" });
-        this.restartResult(restart, "Restart checkpoint could not be confirmed. Inspect the original HEAD ownership, native work and cancelled approval receipts. Intake remains durable and held; no shutdown or prompt replay was attempted.");
+        this.restartResult(restart, "Restart checkpoint could not be confirmed. Inspect the original HEAD ownership, native work and cancelled approval receipts. Intake remains durable and held; no shutdown or prompt replay was attempted. Send a new /restart to retry the checkpoint.");
         this.report(error);
       }
     } finally {

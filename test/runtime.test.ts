@@ -6740,6 +6740,27 @@ describe("controlled Gateway AND HEAD restart", () => {
     expect(JSON.parse(store.getMeta("head:restart-fence")!)).toMatchObject({ state: "accepted", checkpoint: first.checkpoint });
   });
 
+  test("a fresh owner restart can retry a checkpoint that failed before handoff", async () => {
+    const { runtime, main, store, requests } = restartFixture();
+    await runtime.start();
+    const ownerPid = main.state.hostPid;
+    main.state.hostPid = 2_000_000_003;
+    const original = message("restart-checkpoint-failed", route(), "/restart");
+    await admit(runtime, original);
+    const first = JSON.parse(store.getMeta("head:restart-fence")!);
+    expect(first.state).toBe("failed");
+    main.state.hostPid = ownerPid;
+    await admit(runtime, original);
+    expect(requests).toHaveLength(0);
+    const next = message("restart-after-checkpoint-failure", route(), "/restart");
+    await admit(runtime, next);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.inputId).toBe(next.id);
+    expect(requests[0]?.requestId).not.toBe(first.requestId);
+    expect(JSON.parse(store.getMeta("head:restart-fence")!).state).toBe("accepted");
+    expect(main.commands.some(command => command.type === "shutdown_host")).toBe(false);
+  });
+
   test.each(["pending", "submitted", "uncertain"] as const)("durable %s work in either HEAD or a lane survives restart admission without replay", async state => {
     for (const target of ["main", "lane"] as const) {
       const { runtime, store, config, requests } = restartFixture();
